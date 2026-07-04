@@ -1,7 +1,7 @@
 """
 diarization.py — Phase B: Speaker Diarization
 ===============================================
-Assign speaker identities to VAD segments using pyannote.audio 3.1
+Assign speaker identities to VAD segments using pyannote.audio 4.x
 (local inference, no external APIs).
 
 Strategy — Global-to-Local Intersection:
@@ -14,7 +14,7 @@ Strategy — Global-to-Local Intersection:
   4. Renumber segment IDs sequentially and save back to segments.json
 
 VRAM Management (4 GB budget):
-  pyannote.audio 3.1 loads three lightweight models SEQUENTIALLY,
+  pyannote.audio 4.x loads three lightweight models SEQUENTIALLY,
   never concurrently:
     1. Segmentation model  (~80 MB)  — frame-level speaker activity
     2. Embedding model     (~20 MB)  — ECAPA-TDNN speaker vectors
@@ -194,7 +194,7 @@ def load_diarization_pipeline(
     except ImportError:
         log.error(
             "pyannote.audio is not installed.\n"
-            "  Install it with:  pip install 'pyannote.audio>=3.1'\n"
+            "  Install it with:  pip install 'pyannote.audio>=4.0'\n"
             "  Or run:           pip install -r requirements.txt"
         )
         sys.exit(1)
@@ -205,7 +205,7 @@ def load_diarization_pipeline(
     try:
         pipeline = Pipeline.from_pretrained(
             PYANNOTE_PIPELINE_ID,
-            use_auth_token=hf_token,
+            token=hf_token,
         )
     except Exception as exc:
         # Common failure: token lacks access or licenses not accepted
@@ -280,9 +280,10 @@ def run_diarization(
 
     diarization = pipeline(audio_input, **pipeline_kwargs)
 
-    # Convert pyannote Annotation to a flat list of turns
+    # pyannote 4.x returns a DiarizeOutput dataclass;
+    # the Annotation object is under .speaker_diarization
     turns = []
-    for turn, _track, speaker in diarization.itertracks(yield_label=True):
+    for turn, _track, speaker in diarization.speaker_diarization.itertracks(yield_label=True):
         turns.append({
             "start": round(turn.start, 3),
             "end": round(turn.end, 3),
@@ -637,7 +638,7 @@ def run_phase_b(
 # ══════════════════════════════════════════════
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Dubly ME — Phase B: Speaker Diarization (pyannote.audio 3.1)",
+        description="Dubly ME — Phase B: Speaker Diarization (pyannote.audio 4.x)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"

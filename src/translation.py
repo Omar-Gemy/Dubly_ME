@@ -35,7 +35,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 DEFAULT_INPUT = ARTIFACTS_DIR / "transcripts.json"
 DEFAULT_OUTPUT = ARTIFACTS_DIR / "translation.json"
-DEFAULT_MODEL = "Qwen/Qwen2-7B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 
 # ──────────────────────────────────────────────
 #  Heuristic thresholds
@@ -127,10 +127,15 @@ def preprocess_segments(segments: list[dict]) -> list[dict]:
     Flags added:
       - transcription_failed (bool): Whisper loop detected
       - low_confidence (bool): short-duration hallucination suspect
-      - skip_translation (bool): True if either flag is set
+      - _asr_hallucination (bool): ASR flagged as hallucination suspect
+      - _asr_skipped (bool): ASR skipped due to low energy or too short
+      - skip_translation (bool): True if any skip condition is met
     """
     flagged_loops = 0
     flagged_short = 0
+    flagged_asr_hallucination = 0
+    flagged_asr_skipped = 0
+    flagged_empty = 0
 
     for seg in segments:
         text = seg.get("text", "") or ""
@@ -139,17 +144,46 @@ def preprocess_segments(segments: list[dict]) -> list[dict]:
         is_loop = detect_whisper_loop(text)
         is_short_hallucination = detect_short_hallucination(text, duration)
 
+        # ── ASR-flagged hallucination suspects ────────
+        # Segments flagged by ASR's pattern matcher + duplicate detector
+        is_asr_hallucination = seg.get("_hallucination_suspect", False)
+
+        # ── ASR-skipped segments (low energy / too short) ──
+        # These had empty text set by ASR — no point sending to LLM
+        is_skipped_by_asr = (
+            seg.get("_skipped_low_energy", False)
+            or seg.get("_skipped_too_short", False)
+        )
+
+        # ── Empty text guard ──────────────────────────
+        # Catch any segment with blank text regardless of flags
+        is_empty = not text.strip()
+
         seg["transcription_failed"] = is_loop
         seg["low_confidence"] = is_short_hallucination
-        seg["skip_translation"] = is_loop or is_short_hallucination
+        seg["_asr_hallucination"] = is_asr_hallucination
+        seg["_asr_skipped"] = is_skipped_by_asr
+        seg["skip_translation"] = (
+            is_loop or is_short_hallucination
+            or is_asr_hallucination or is_skipped_by_asr or is_empty
+        )
 
         if is_loop:
             flagged_loops += 1
         if is_short_hallucination:
             flagged_short += 1
+        if is_asr_hallucination:
+            flagged_asr_hallucination += 1
+        if is_skipped_by_asr:
+            flagged_asr_skipped += 1
+        if is_empty:
+            flagged_empty += 1
 
     print(f"       Whisper loops detected  : {flagged_loops}")
     print(f"       Short hallucinations    : {flagged_short}")
+    print(f"       ASR hallucination flags : {flagged_asr_hallucination}")
+    print(f"       ASR skipped (energy/dur): {flagged_asr_skipped}")
+    print(f"       Empty text segments     : {flagged_empty}")
     skipped = sum(1 for s in segments if s["skip_translation"])
     print(f"       Segments to skip        : {skipped}")
     translatable = len(segments) - skipped
@@ -162,12 +196,25 @@ def preprocess_segments(segments: list[dict]) -> list[dict]:
 #  Step 3 — LLM-based contextual translation
 # ──────────────────────────────────────────────
 SYSTEM_PROMPT = (
-    "You are a professional dubbing translator translating Egyptian Arabic "
-    "to English. You receive the previous segment for context, but you must "
-    "ONLY output the English translation of the current segment. "
-    "Produce natural, spoken-style English suitable for dubbing. "
-    "Ignore any obvious ASR hallucinations or artifacts in the source text. "
-    "Output ONLY the translated text, nothing else."
+    "You are a TRANSLATION ENGINE — not a chatbot, not an assistant.\n"
+    "Your SOLE function is to translate Egyptian Arabic speech into "
+    "natural spoken English for video dubbing.\n\n"
+    "ABSOLUTE RULES:\n"
+    "1. Output ONLY the English translation. Nothing else.\n"
+    "2. NEVER respond conversationally. NEVER say 'Sure', 'Here is', "
+    "'I can help', 'Please provide', or any similar phrase.\n"
+    "3. NEVER add notes, explanations, syllable counts, or commentary.\n"
+    "4. NEVER repeat the source Arabic text.\n"
+    "5. If the input is empty, garbled, or untranslatable, output "
+    "exactly: [SKIP]\n"
+    "6. LENGTH MATCHING: Your English translation MUST have approximately "
+    "the SAME number of syllables as the original Arabic. Use "
+    "contractions, shorter synonyms, and spoken phrasing to match "
+    "duration for lip-sync.\n"
+    "7. STYLE: Produce natural, conversational spoken English suitable "
+    "for voice-over dubbing.\n"
+    "8. CONTEXT: The previous segment is provided for continuity only. "
+    "Translate ONLY the current segment.\n"
 )
 
 
@@ -187,11 +234,10 @@ def load_translation_model(
     device: str = "auto",
 ) -> tuple:
     """
-    Load the Qwen model and tokenizer with 4-bit quantization
-    for memory-efficient local inference.
+    Load the Qwen model and tokenizer with 8-bit quantization
+    (LLM.int8) for memory-efficient local inference.
 
-    Falls back to 8-bit if 4-bit is unavailable, then to full
-    precision (float16/float32) as a last resort.
+    Falls back to full precision (float16) as a last resort.
     """
     print(f"  Loading model: {model_name}")
     print(f"  Device: {device}")
@@ -201,20 +247,19 @@ def load_translation_model(
         trust_remote_code=True,
     )
 
-    # Try 4-bit quantization first (requires bitsandbytes)
+    # Use 8-bit quantization (LLM.int8) for best balance of
+    # VRAM efficiency and instruction-following on Colab T4.
+    # 8-bit uses ~8 GB for 7B params, leaving ~7 GB for KV cache.
     quant_config = None
     quant_label = "float16"
     try:
         quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
+            load_in_8bit=True,
         )
-        quant_label = "4-bit (nf4)"
+        quant_label = "8-bit (LLM.int8)"
         print(f"  Quantization: {quant_label}")
     except Exception:
-        print("  ⚠ 4-bit quantization unavailable, trying float16 …")
+        print("  ⚠ 8-bit quantization unavailable, falling back to float16 …")
         quant_config = None
 
     load_kwargs = {
@@ -234,6 +279,16 @@ def load_translation_model(
     return model, tokenizer
 
 
+# ── Post-generation chatbot leakage patterns ─────────
+# If the model ignores the system prompt and responds conversationally,
+# these prefixes are stripped defensively.
+LEAKAGE_PATTERNS = [
+    "sure,", "here is", "i can help", "please provide",
+    "i'd be happy", "of course", "certainly",
+    "let me", "i'll translate", "the translation is",
+]
+
+
 def translate_single(
     model,
     tokenizer,
@@ -245,6 +300,9 @@ def translate_single(
     Translate a single segment using the loaded LLM.
     Uses the chat template if available, otherwise falls back
     to a simple prompt format.
+
+    Includes post-generation sanitization to catch any residual
+    chatbot leakage that bypasses the system prompt.
     """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -274,6 +332,22 @@ def translate_single(
     input_len = inputs["input_ids"].shape[1]
     generated = outputs[0][input_len:]
     result = tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+    # ── Post-generation sanitization ──────────────────
+    # Catch any residual chatbot leakage patterns that bypass
+    # the system prompt (common with quantized models).
+    result_lower = result.lower()
+    for pattern in LEAKAGE_PATTERNS:
+        if result_lower.startswith(pattern):
+            # Strip the conversational prefix — take text after first separator
+            for sep in [":\n", ":\r\n", "\n", ": "]:
+                if sep in result:
+                    result = result.split(sep, 1)[1].strip()
+                    break
+            else:
+                # No separator found — entire output is leakage
+                result = "[SKIP]"
+            break
 
     return result
 
@@ -306,7 +380,13 @@ def translate_segments(
                 reason.append("whisper-loop")
             if seg.get("low_confidence"):
                 reason.append("short-hallucination")
-            reason_str = ", ".join(reason)
+            if seg.get("_asr_hallucination"):
+                reason.append("asr-hallucination")
+            if seg.get("_asr_skipped"):
+                reason.append("asr-skipped")
+            if not (seg.get("text", "") or "").strip():
+                reason.append("empty-text")
+            reason_str = ", ".join(reason) or "flagged"
 
             print(
                 f"  [{idx}/{total}]  Segment #{seg_id}  "
@@ -326,6 +406,14 @@ def translate_segments(
         translated = translate_single(
             model, tokenizer, prev_text, text
         )
+
+        # Handle untranslatable output from the model
+        if translated == "[SKIP]" or not translated.strip():
+            seg["translated_text"] = None
+            seg["_translation_skipped"] = True
+            print(f"⏭ SKIPPED (model returned [SKIP])")
+            continue
+
         seg["translated_text"] = translated
         translated_count += 1
 
