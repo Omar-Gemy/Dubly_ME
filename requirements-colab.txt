@@ -1,0 +1,24 @@
+# Dubly ME — Colab Runtime Dependencies (Colab T4)
+# ─────────────────────────────────────────────────────────────────
+# Jointly-compatible pin set for WhisperX (alignment) + AutoAWQ (Phase D).
+# transformers is held < 4.49 so transformers.activations.PytorchGELUTanh
+# (imported by AutoAWQ) still exists; 4.47.1 is the version AutoAWQ 0.2.8 is
+# validated against and is well inside WhisperX (>=4.19).
+soundfile
+numpy<2.0
+# Phase B/C: WhisperX pins compatible faster-whisper, ctranslate2 AND
+# pyannote.audio (3.1.1) transitively — we do NOT pin any of them here:
+#   • an explicit faster-whisper==1.2.1 conflicts with whisperx 3.3.1's pin
+#   • an explicit pyannote.audio==4.0.7 conflicts with whisperx's pyannote 3.1.1
+# The pyannote 3.1.1 ↔ new-torchaudio break (missing torchaudio.AudioMetaData)
+# is handled at runtime by src/torchaudio_compat.py, and diarization.py accepts
+# both the pyannote 3.x and 4.x pipeline return shapes.
+whisperx==3.3.1
+transformers==4.47.1
+accelerate>=1.1.0,<1.3.0
+bitsandbytes>=0.44.0
+# Phase D: 4-bit AWQ inference for Qwen2.5-14B-Instruct-AWQ
+autoawq==0.2.8
+sentencepiece>=0.2.0
+protobuf>=4.25.0,<6.0
+onnxruntime>=1.19.0

@@ -1,0 +1,27 @@
+{
+  "_comment": "Dubly ME — Phase D name/terminology glossary. Canonical Arabic→English spellings for recurring proper nouns so a character is never renamed mid-episode. The translation stage injects any entry whose 'ar' surface form (or a listed variant) appears in the current or previous line into the LLM prompt as a 'use this exact spelling' instruction. Curate per production; seeded from the first test-episode run.",
+  "names": [
+    {
+      "ar": "شوقي",
+      "en": "Shawky",
+      "variants": ["عم شوقي", "عمي شوقي", "عمشاوق", "عم شاوق"],
+      "note": "Recurring character (uncle). ASR sometimes garbles as عمشاوق; earlier runs drifted between Shukry/Shawky."
+    },
+    {
+      "ar": "علاء",
+      "en": "Alaa",
+      "variants": ["علا"],
+      "note": "Distinct from علي (Ali) — do NOT translate as Ali."
+    },
+    {
+      "ar": "صلاح",
+      "en": "Salah",
+      "variants": ["يا صلاح"]
+    },
+    {
+      "ar": "سلمان",
+      "en": "Salman",
+      "variants": []
+    }
+  ]
+}

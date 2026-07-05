@@ -1,7 +1,7 @@
 """
 diarization.py — Phase B: Speaker Diarization
 ===============================================
-Assign speaker identities to VAD segments using pyannote.audio 3.1
+Assign speaker identities to VAD segments using pyannote.audio 4.x
 (local inference, no external APIs).
 
 Strategy — Global-to-Local Intersection:
@@ -14,7 +14,7 @@ Strategy — Global-to-Local Intersection:
   4. Renumber segment IDs sequentially and save back to segments.json
 
 VRAM Management (4 GB budget):
-  pyannote.audio 3.1 loads three lightweight models SEQUENTIALLY,
+  pyannote.audio 4.x loads three lightweight models SEQUENTIALLY,
   never concurrently:
     1. Segmentation model  (~80 MB)  — frame-level speaker activity
     2. Embedding model     (~20 MB)  — ECAPA-TDNN speaker vectors
@@ -39,6 +39,11 @@ from typing import Optional
 import torch
 import torchaudio
 
+# WhisperX 3.3.1 forces pyannote.audio 3.1.1, which breaks on recent torchaudio
+# (missing torchaudio.AudioMetaData). Patch it before pyannote is imported.
+import torchaudio_compat
+torchaudio_compat.apply()
+
 # ──────────────────────────────────────────────
 #  Logging
 # ──────────────────────────────────────────────
@@ -62,6 +67,13 @@ DEFAULT_AUDIO = PROJECT_ROOT / "data" / "audio_out" / "_temp_normalised.wav"
 # ──────────────────────────────────────────────
 MIN_SUB_SEGMENT_SEC = 0.3   # sub-segments shorter than this are merged
 PYANNOTE_PIPELINE_ID = "pyannote/speaker-diarization-3.1"
+
+# A VAD segment is only split across speakers when a SECONDARY speaker's
+# coverage is substantial — otherwise a brief diarization boundary error would
+# sever a single continuous sentence (observed: seg 17 "…لازم تلاقيه في" | "كل
+# بيت" split onto two speakers). Both conditions must hold to justify a split.
+SPLIT_MIN_SECONDARY_FRAC = 0.25   # ≥25% of the segment's duration, AND
+SPLIT_MIN_SECONDARY_SEC = 0.7     # ≥0.7s of absolute coverage
 
 
 # ══════════════════════════════════════════════
@@ -194,7 +206,7 @@ def load_diarization_pipeline(
     except ImportError:
         log.error(
             "pyannote.audio is not installed.\n"
-            "  Install it with:  pip install 'pyannote.audio>=3.1'\n"
+            "  Install it with:  pip install 'pyannote.audio>=4.0'\n"
             "  Or run:           pip install -r requirements.txt"
         )
         sys.exit(1)
@@ -203,10 +215,18 @@ def load_diarization_pipeline(
     log.info("  (First run will download ~300 MB of model weights)")
 
     try:
-        pipeline = Pipeline.from_pretrained(
-            PYANNOTE_PIPELINE_ID,
-            use_auth_token=hf_token,
-        )
+        try:
+            pipeline = Pipeline.from_pretrained(
+                PYANNOTE_PIPELINE_ID,
+                token=hf_token,
+            )
+        except TypeError:
+            # pyannote 3.1.1 (pinned transitively by whisperx) uses the
+            # older `use_auth_token` kwarg instead of `token` (pyannote 4.x).
+            pipeline = Pipeline.from_pretrained(
+                PYANNOTE_PIPELINE_ID,
+                use_auth_token=hf_token,
+            )
     except Exception as exc:
         # Common failure: token lacks access or licenses not accepted
         error_str = str(exc).lower()
@@ -280,9 +300,13 @@ def run_diarization(
 
     diarization = pipeline(audio_input, **pipeline_kwargs)
 
-    # Convert pyannote Annotation to a flat list of turns
+    # pyannote 4.x returns a DiarizeOutput dataclass (Annotation under
+    # .speaker_diarization); pyannote 3.1.x returns the Annotation directly.
+    # WhisperX 3.3.1 pins 3.1.1, so support both shapes.
+    annotation = getattr(diarization, "speaker_diarization", diarization)
+
     turns = []
-    for turn, _track, speaker in diarization.itertracks(yield_label=True):
+    for turn, _track, speaker in annotation.itertracks(yield_label=True):
         turns.append({
             "start": round(turn.start, 3),
             "end": round(turn.end, 3),
@@ -374,6 +398,7 @@ def intersect_and_split(
     """
     new_segments = []
     split_count = 0
+    dominant_kept_count = 0   # multi-speaker segments NOT split (minor secondary)
 
     for seg in segments:
         seg_start = seg["start_time"]
@@ -406,15 +431,42 @@ def intersect_and_split(
             new_segments.append(result_seg)
             continue
 
-        # ── Case 2: Single speaker ────────────────────────────
-        unique_speakers = set(t["speaker"] for t in overlapping_turns)
-        if len(unique_speakers) == 1:
+        # ── Aggregate per-speaker coverage within this segment ──
+        coverage: dict[str, float] = {}
+        for t in overlapping_turns:
+            coverage[t["speaker"]] = coverage.get(t["speaker"], 0.0) + t["overlap"]
+        unique_speakers = set(coverage)
+        dominant_speaker = max(coverage, key=coverage.get)
+        seg_duration = seg_end - seg_start
+
+        # A secondary speaker justifies a split only if its coverage is BOTH
+        # ≥ SPLIT_MIN_SECONDARY_FRAC of the segment AND ≥ SPLIT_MIN_SECONDARY_SEC.
+        def _justifies_split(spk: str) -> bool:
+            cov = coverage[spk]
+            frac = cov / seg_duration if seg_duration > 0 else 0.0
+            return cov >= SPLIT_MIN_SECONDARY_SEC and frac >= SPLIT_MIN_SECONDARY_FRAC
+
+        secondary_justifies = any(
+            _justifies_split(spk) for spk in unique_speakers if spk != dominant_speaker
+        )
+
+        # ── Case 2: Single speaker, or no secondary speaker meets the
+        #            split threshold → assign whole segment to the dominant. ──
+        if len(unique_speakers) == 1 or not secondary_justifies:
+            if len(unique_speakers) > 1:
+                dominant_kept_count += 1
+                log.info(
+                    "Segment #%d (%.1fs–%.1fs, %.1fs): %d speakers overlap but "
+                    "secondary coverage below threshold — assigning dominant %s",
+                    original_id, seg_start, seg_end, seg["duration"],
+                    len(unique_speakers), dominant_speaker,
+                )
             result_seg = dict(seg)
-            result_seg["speaker_id"] = overlapping_turns[0]["speaker"]
+            result_seg["speaker_id"] = dominant_speaker
             new_segments.append(result_seg)
             continue
 
-        # ── Case 3: Multiple speakers — split at boundaries ──
+        # ── Case 3: Genuine multi-speaker — split at boundaries ──
         split_count += 1
         log.info(
             "Segment #%d (%.1fs–%.1fs, %.1fs): splitting across %d speakers: %s",
@@ -459,11 +511,89 @@ def intersect_and_split(
 
     log.info(
         "Intersection complete: %d input segment(s) → %d output segment(s) "
-        "(%d segment(s) were split)",
-        len(segments), len(new_segments), split_count,
+        "(%d split, %d multi-speaker kept whole)",
+        len(segments), len(new_segments), split_count, dominant_kept_count,
     )
 
     return new_segments
+
+
+# ══════════════════════════════════════════════
+#  Step 5b — Re-join over-split fragments
+# ══════════════════════════════════════════════
+CONTIGUITY_TOLERANCE_SEC = 0.05   # fragments within this gap count as contiguous
+
+
+def rejoin_same_origin_fragments(segments: list[dict]) -> list[dict]:
+    """
+    Merge adjacent fragments that came from the SAME original VAD segment and
+    resolve to the SAME speaker — undoing over-splitting that would otherwise
+    sever one continuous utterance into independently-translated pieces.
+
+    Conservative by design (same-origin only):
+      - both fragments must carry the same non-null ``_original_segment_id``
+      - both must have the same ``speaker_id``
+      - they must be time-contiguous (gap ≤ CONTIGUITY_TOLERANCE_SEC)
+
+    Fragments without an ``_original_segment_id`` (i.e. never split) and
+    boundaries between different origins or speakers are left untouched. The
+    merged segment spans [first.start, last.end]; its ``_merged_from`` records
+    each contributing fragment's origin id and time range for later review.
+
+    NOTE: because Case 3 already coalesces consecutive same-speaker turns
+    within a split, this pass is primarily a safety net and fires rarely on
+    well-behaved diarization output.
+    """
+    if not segments:
+        return segments
+
+    merged: list[dict] = []
+    for seg in segments:
+        prev = merged[-1] if merged else None
+        origin = seg.get("_original_segment_id")
+
+        can_merge = (
+            prev is not None
+            and origin is not None
+            and prev.get("_original_segment_id") == origin
+            and prev.get("speaker_id") == seg.get("speaker_id")
+            and (seg["start_time"] - prev["end_time"]) <= CONTIGUITY_TOLERANCE_SEC
+        )
+
+        if not can_merge:
+            merged.append(dict(seg))
+            continue
+
+        # ── Merge seg into prev ────────────────────────────────
+        # Seed _merged_from with prev's own span on first merge.
+        if "_merged_from" not in prev:
+            prev["_merged_from"] = [{
+                "original_segment_id": prev.get("_original_segment_id"),
+                "start_time": prev["start_time"],
+                "end_time": prev["end_time"],
+            }]
+        prev["_merged_from"].append({
+            "original_segment_id": origin,
+            "start_time": seg["start_time"],
+            "end_time": seg["end_time"],
+        })
+
+        prev["end_time"] = seg["end_time"]
+        prev["duration"] = round(prev["end_time"] - prev["start_time"], 3)
+
+        # Preserve any transcribed text (usually None at Phase B).
+        prev_text = (prev.get("text") or "").strip()
+        seg_text = (seg.get("text") or "").strip()
+        if seg_text and seg_text != prev_text:
+            prev["text"] = (prev_text + " " + seg_text).strip() if prev_text else seg_text
+
+    n_rejoined = sum(1 for s in merged if "_merged_from" in s)
+    if n_rejoined:
+        log.info(
+            "Re-join pass: %d segment(s) → %d after merging %d over-split group(s)",
+            len(segments), len(merged), n_rejoined,
+        )
+    return merged
 
 
 def _merge_short_subsegments(
@@ -605,6 +735,12 @@ def run_phase_b(
         min_sub_segment_sec=min_sub_segment_sec,
     )
 
+    # Re-join fragments over-split from the same original VAD segment onto the
+    # same speaker (prevents one utterance from being translated in pieces).
+    post_split_count = len(new_segments)
+    new_segments = rejoin_same_origin_fragments(new_segments)
+    rejoined_count = post_split_count - len(new_segments)
+
     # Renumber and update the data contract
     new_segments = renumber_segments(new_segments)
 
@@ -621,7 +757,8 @@ def run_phase_b(
     segments_data["diarization_stats"] = {
         "original_segment_count": original_count,
         "final_segment_count": len(new_segments),
-        "segments_split": len(new_segments) - original_count,
+        "segments_split": post_split_count - original_count,
+        "segments_rejoined": rejoined_count,
         "unique_speakers": len(unique_speakers),
         "speaker_labels": unique_speakers,
     }
@@ -637,7 +774,7 @@ def run_phase_b(
 # ══════════════════════════════════════════════
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Dubly ME — Phase B: Speaker Diarization (pyannote.audio 3.1)",
+        description="Dubly ME — Phase B: Speaker Diarization (pyannote.audio 4.x)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
