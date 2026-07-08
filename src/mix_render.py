@@ -71,6 +71,10 @@ LOUDNORM_I         = -16       # EBU R128 integrated loudness target (LUFS, web)
 LOUDNORM_TP        = -1.5      # True-peak ceiling (dBTP)
 LOUDNORM_LRA       = 11        # Loudness range target
 
+# QW-3 — Collision safety margin: trimmed segments end this far (in seconds)
+# before the next segment starts, preventing overlap-induced volume spikes.
+COLLISION_MARGIN_S = 0.05      # 50 ms safety gap
+
 # ── Phase 3B — background (M&E) bed + sidechain ducking ──
 # When the Phase F0 stems exist, the bed plays continuously under the whole
 # timeline and is ducked beneath speech (dubbed + passthrough) so dialogue
@@ -229,11 +233,21 @@ def build_audio_timeline(
     timeline = np.zeros(total_samples, dtype=np.float32)
     fade_samples = int(CROSSFADE_MS / 1000.0 * SAMPLE_RATE)
     declick_samples = int(DECLICK_MS / 1000.0 * SAMPLE_RATE)
+    collision_margin_samples = int(COLLISION_MARGIN_S * SAMPLE_RATE)
 
     # Build a lookup from segment_id → timing info
     timing_lookup = {}
     for seg in segments_data["segments"]:
         timing_lookup[seg["segment_id"]] = seg
+
+    # QW-3: Pre-compute sorted segment start times for collision detection.
+    # For each segment, find the start_time of the *next* segment in timeline
+    # order to check whether the current segment's audio would bleed into it.
+    all_start_times = sorted(
+        timing_lookup[seg["segment_id"]]["start_time"]
+        for seg in stretch_manifest["segments"]
+        if seg["segment_id"] in timing_lookup
+    )
 
     placement_log = []
     speech_intervals: list[tuple[int, int]] = []
@@ -274,6 +288,28 @@ def build_audio_timeline(
 
             seg_audio = audio_data.copy()
 
+            # ── QW-3: Collision-aware tail trimming ────────
+            # If this segment's audio would bleed into the next segment's
+            # start time, trim it (with fade-out) to prevent overlap energy
+            # doubling and the volume spikes it causes.
+            trimmed = False
+            # Find the next segment's start time after this one.
+            next_starts = [t for t in all_start_times if t > start_time]
+            if next_starts:
+                next_start_sample = int(next_starts[0] * SAMPLE_RATE)
+                max_end_sample = next_start_sample - collision_margin_samples
+                if start_sample + len(seg_audio) > max_end_sample:
+                    max_len = max(0, max_end_sample - start_sample)
+                    if max_len > 0 and max_len < len(seg_audio):
+                        # Apply a short fade-out on the trim edge.
+                        fade_n = min(int(0.01 * SAMPLE_RATE), max_len // 2)
+                        if fade_n > 0:
+                            seg_audio[max_len - fade_n:max_len] *= np.linspace(
+                                1.0, 0.0, fade_n, dtype=np.float32
+                            )
+                        seg_audio = seg_audio[:max_len]
+                        trimmed = True
+
             # Apply crossfade
             apply_crossfade(timeline, start_sample, seg_audio, fade_samples, declick_samples)
 
@@ -291,8 +327,9 @@ def build_audio_timeline(
             speech_intervals.append((start_sample, start_sample + len(seg_audio)))
 
             actual_dur = len(seg_audio) / SAMPLE_RATE
+            trim_flag = "  ✂ TRIMMED" if trimmed else ""
             print(f"  #{seg_id:<3}  🎙 DUBBED     "
-                  f"@ {start_time:.2f}s  ({actual_dur:.2f}s)")
+                  f"@ {start_time:.2f}s  ({actual_dur:.2f}s){trim_flag}")
 
             placement_log.append({
                 "segment_id": seg_id,
@@ -301,6 +338,7 @@ def build_audio_timeline(
                 "placed_duration_s": round(actual_dur, 3),
                 "original_duration_s": orig_duration,
                 "source_file": seg_entry["output_file"],
+                "collision_trimmed": trimmed,
             })
 
         # ── Skipped segment → Arabic passthrough (Q2) ──

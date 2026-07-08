@@ -32,12 +32,15 @@ import gc
 import json
 import os
 os.environ["COQUI_TOS_AGREED"] = "1"
+import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import soundfile as sf
 import torch
 
@@ -77,18 +80,18 @@ MAX_SPEAKER_REF_SEC   = 8.0                 # cap the extracted reference window
 # XTTS v2 generation controls (forwarded through tts_to_file → Xtts.inference).
 # Verified against coqui-tts 0.27.5. Defaults tuned for dubbing: warmer than
 # flat greedy output, but tightly controlled to avoid rambling/hallucination.
-#   • repetition_penalty 5.0 (< the 10.0 XTTS default) → less clipped, more
-#     natural prosody without runaway repeats.
-#   • enable_text_splitting → long lines are chunked so intonation resets
-#     naturally instead of degrading across a single long generation.
+#   • repetition_penalty 3.0 (QW-7: lowered from 5.0 to reduce prosody
+#     flattening on longer chunks; still prevents runaway repeats).
+#   • enable_text_splitting DISABLED (QW-6): our custom sentence-level chunker
+#     replaces the built-in 250-char splitter to avoid double-splitting.
 XTTS_GEN_DEFAULTS = {
     "temperature": 0.70,
     "length_penalty": 1.0,
-    "repetition_penalty": 5.0,
+    "repetition_penalty": 3.0,
     "top_k": 50,
     "top_p": 0.85,
     "speed": 1.0,
-    "enable_text_splitting": True,
+    "enable_text_splitting": False,
 }
 
 # Fallback reference extraction window (only used if voice_ref.wav
@@ -333,6 +336,144 @@ def load_tts_model(device: str = "auto"):
 
 
 # ──────────────────────────────────────────────
+#  QW-6 — Sentence-level chunking for prosody
+# ──────────────────────────────────────────────
+# XTTS v2 loses emotional context on long generations (>~15s). We split text
+# at sentence boundaries, synthesize each chunk separately, and concatenate
+# with short crossfades. This resets the autoregressive decoder's prosodic
+# thread at each sentence, preventing monotone collapse.
+
+# Maximum estimated audio duration (seconds) per chunk before splitting.
+_MAX_CHUNK_AUDIO_SEC = 15.0
+# Approximate syllables per second for chunk-size estimation.
+_CHUNK_SYLL_PER_SEC = 4.0
+# Crossfade between concatenated chunks (milliseconds).
+_CHUNK_CROSSFADE_MS = 30
+
+
+def _chunk_text_by_sentences(text: str, max_audio_sec: float = _MAX_CHUNK_AUDIO_SEC) -> list[str]:
+    """
+    Split *text* into sentence-level chunks, each estimated to produce
+    ≤ *max_audio_sec* of TTS audio.  Splits at sentence-ending punctuation
+    first (.!?؟), then at clause boundaries (,،;) if a single sentence
+    is still too long.
+
+    Returns a list of non-empty chunks.  If the text is short enough, it
+    is returned as a single-element list (no splitting).
+    """
+    if not text or not text.strip():
+        return [text] if text else []
+
+    max_syll = int(max_audio_sec * _CHUNK_SYLL_PER_SEC)
+
+    # First pass: split at sentence boundaries.
+    # The regex keeps the delimiter attached to the preceding sentence.
+    sentences = re.split(r'(?<=[.!?؟])', text.strip())
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    # Second pass: break oversized sentences at clause boundaries.
+    chunks: list[str] = []
+    for sent in sentences:
+        # Rough syllable estimate: ~1 syllable per 3 characters (Latin/Arabic average).
+        est_syll = max(1, len(sent) // 3)
+        if est_syll <= max_syll:
+            chunks.append(sent)
+        else:
+            # Split at clause-level punctuation.
+            clauses = re.split(r'(?<=[,،;:])', sent)
+            clauses = [c.strip() for c in clauses if c.strip()]
+            buf = ""
+            for clause in clauses:
+                test = (buf + " " + clause).strip() if buf else clause
+                if len(test) // 3 > max_syll and buf:
+                    chunks.append(buf)
+                    buf = clause
+                else:
+                    buf = test
+            if buf:
+                chunks.append(buf)
+
+    return chunks if chunks else [text]
+
+
+def _concatenate_chunk_wavs(
+    chunk_paths: list[Path],
+    output_path: Path,
+    crossfade_ms: float = _CHUNK_CROSSFADE_MS,
+) -> None:
+    """
+    Concatenate multiple WAV files with a short equal-power crossfade.
+    Reads all chunks, stitches them with *crossfade_ms* overlap, and writes
+    the result to *output_path*.
+    """
+    if len(chunk_paths) == 1:
+        # Single chunk — just rename/copy.
+        import shutil
+        shutil.copy2(str(chunk_paths[0]), str(output_path))
+        return
+
+    # Read all chunks.
+    arrays = []
+    sr = None
+    for p in chunk_paths:
+        y, s = sf.read(str(p), dtype="float32")
+        if sr is None:
+            sr = s
+        elif s != sr:
+            # Resample if needed (shouldn't happen with XTTS, but defensive).
+            from scipy.signal import resample_poly
+            from math import gcd
+            g = gcd(s, sr)
+            y = resample_poly(y, sr // g, s // g).astype(np.float32)
+        arrays.append(y)
+
+    fade_n = int(crossfade_ms / 1000.0 * sr)
+
+    # Stitch with crossfade.
+    result = arrays[0]
+    for nxt in arrays[1:]:
+        f = min(fade_n, len(result), len(nxt))
+        if f > 0:
+            t = np.linspace(0.0, 1.0, f, dtype=np.float32)
+            result[-f:] *= np.sqrt(1.0 - t)   # fade-out tail
+            nxt[:f] *= np.sqrt(t)              # fade-in head
+            # Overlap-add the crossfade region.
+            overlap = result[-f:] + nxt[:f]
+            result = np.concatenate([result[:-f], overlap, nxt[f:]])
+        else:
+            result = np.concatenate([result, nxt])
+
+    sf.write(str(output_path), result, sr, subtype="PCM_16")
+
+
+# ──────────────────────────────────────────────
+#  QW-2 — Speed ramp for overlong segments
+# ──────────────────────────────────────────────
+# Pre-emptively increase XTTS speaking rate for segments whose translated
+# text is estimated to overflow the time window, reducing downstream
+# time-stretch pressure.
+
+def _compute_speed_ramp(text: str, original_duration: float) -> float:
+    """
+    Estimate whether *text* will overflow *original_duration* when spoken
+    at normal speed.  If the estimated ratio > 1.5×, return a modest speed
+    boost (up to 1.25×); otherwise return 1.0 (no ramp).
+
+    The estimation uses ~1 syllable per 3 characters and ~4 syllables/sec.
+    """
+    if original_duration <= 0:
+        return 1.0
+    est_syll = max(1, len(text) // 3)
+    est_audio_sec = est_syll / _CHUNK_SYLL_PER_SEC
+    ratio = est_audio_sec / original_duration
+    if ratio > 2.0:
+        return 1.25
+    if ratio > 1.5:
+        return 1.15
+    return 1.0
+
+
+# ──────────────────────────────────────────────
 #  Step 3 — Synthesize segments
 # ──────────────────────────────────────────────
 def synthesize_segments(
@@ -429,14 +570,49 @@ def synthesize_segments(
         t_seg_start = time.perf_counter()
 
         try:
-            with torch.no_grad():
-                tts.tts_to_file(
-                    text=text,
-                    file_path=str(out_path),
-                    speaker_wav=str(ref_path),
-                    language=language,
-                    **gen,
-                )
+            # ── QW-6: Sentence-level chunking ─────────
+            chunks = _chunk_text_by_sentences(text)
+            n_chunks = len(chunks)
+
+            # ── QW-2: Speed ramp for overlong segments ─
+            orig_dur = seg.get("duration", 0.0) or 0.0
+            speed_ramp = _compute_speed_ramp(text, orig_dur)
+            seg_gen = dict(gen)
+            if speed_ramp > 1.0:
+                seg_gen["speed"] = speed_ramp
+                print(f"           ▶ speed ramp {speed_ramp:.2f}×")
+
+            if n_chunks > 1:
+                print(f"           ▶ chunked into {n_chunks} sentences")
+
+            # Synthesize each chunk into a temp WAV.
+            chunk_paths: list[Path] = []
+            chunk_tmp_dir = output_dir / "_chunks"
+            chunk_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+            for ci, chunk_text in enumerate(chunks):
+                if n_chunks == 1:
+                    chunk_out = out_path
+                else:
+                    chunk_out = chunk_tmp_dir / f"seg{seg_id:03d}_c{ci:02d}.wav"
+
+                with torch.no_grad():
+                    tts.tts_to_file(
+                        text=chunk_text,
+                        file_path=str(chunk_out),
+                        speaker_wav=str(ref_path),
+                        language=language,
+                        **seg_gen,
+                    )
+                chunk_paths.append(chunk_out)
+
+            # Concatenate chunks with crossfade if multi-chunk.
+            if n_chunks > 1:
+                _concatenate_chunk_wavs(chunk_paths, out_path)
+                # Clean up temp chunk files.
+                for cp in chunk_paths:
+                    if cp != out_path and cp.is_file():
+                        cp.unlink()
 
             # Verify the output file was actually created
             if not out_path.is_file():
@@ -458,11 +634,18 @@ def synthesize_segments(
                 "duration_s": round(info.duration, 3),
                 "original_duration_s": seg.get("duration"),
                 "text": text,
+                "n_chunks": n_chunks,
+                "speed_ramp": speed_ramp,
             })
             synthesized_count += 1
 
+            extra = ""
+            if n_chunks > 1:
+                extra += f"  chunks={n_chunks}"
+            if speed_ramp > 1.0:
+                extra += f"  speed={speed_ramp:.2f}×"
             print(f"           ✔ saved → {out_filename}  "
-                  f"({info.duration:.2f}s, took {t_seg_elapsed:.1f}s)")
+                  f"({info.duration:.2f}s, took {t_seg_elapsed:.1f}s){extra}")
 
         except Exception as e:
             t_seg_elapsed = time.perf_counter() - t_seg_start

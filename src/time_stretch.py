@@ -191,6 +191,28 @@ def _apply_tail_fade(path: Path, fade_ms: float) -> None:
 
 
 # ──────────────────────────────────────────────
+#  QW-4 — Per-segment RMS normalization
+# ──────────────────────────────────────────────
+# Time-stretching via pyrubberband can attenuate or boost amplitude by
+# ±6 dB depending on the ratio. Normalizing each segment to a consistent
+# RMS level after stretching ensures uniform perceived loudness.
+RMS_TARGET = 0.08    # ≈22 dBFS RMS — safe speech level with bed headroom
+
+
+def _normalize_rms(path: Path, target_rms: float = RMS_TARGET) -> None:
+    """
+    Normalize the segment to a consistent RMS level in-place.
+    Prevents volume fluctuations caused by time-stretch amplitude drift.
+    """
+    y, sr = sf.read(str(path), dtype="float32")
+    current_rms = float(np.sqrt(np.mean(y ** 2)))
+    if current_rms > 1e-6:  # avoid division by zero on silence
+        gain = target_rms / current_rms
+        y = np.clip(y * gain, -1.0, 1.0).astype(np.float32)
+        sf.write(str(path), y, sr, subtype="PCM_16")
+
+
+# ──────────────────────────────────────────────
 #  Classify and process a single segment
 # ──────────────────────────────────────────────
 def classify_segment(
@@ -341,6 +363,8 @@ def process_segment(
             # De-click the trimmed tail of over-cap (overflowing) segments.
             if tier == "over-cap":
                 _apply_tail_fade(out_path, OVERCAP_FADE_MS)
+            # QW-4: Normalize RMS to consistent level after stretching.
+            _normalize_rms(out_path)
             info = sf.info(str(out_path))
             output_duration = round(info.duration, 3)
 

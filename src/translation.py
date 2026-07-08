@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import copy
+import re
 import json
 import os
 import string
@@ -543,6 +544,172 @@ def translate_single(
     return result
 
 
+# ──────────────────────────────────────────────
+#  QW-1 — Post-translation length gate
+# ──────────────────────────────────────────────
+# Catches egregious translation bloat that would cause >2× time-stretch.
+# Fires only when the output exceeds the generous syllable ceiling by ≥50%.
+
+def estimate_syllables(text: str) -> int:
+    """
+    Estimate syllable count for length-gate purposes.
+
+    English: counts vowel clusters (a-e-i-o-u-y groups). ~85% accurate —
+    sufficient for a ±15% tolerance band.
+    Arabic:  counts Arabic vowel letters (ا و ي ى ة) + explicit diacritics
+    (fatHa, kasra, Damma, tanwiin, shadda, sukuun). This is a rough proxy;
+    Arabic syllable structure is complex, but for the purpose of detecting
+    *gross* overruns (≥50% over budget) it is adequate.
+    Other:   falls back to the English heuristic.
+    """
+    if not text or not text.strip():
+        return 0
+
+    # Detect whether the text is predominantly Arabic (Unicode block 0600–06FF).
+    arabic_chars = sum(1 for c in text if '\u0600' <= c <= '\u06FF')
+    total_alpha = sum(1 for c in text if c.isalpha()) or 1
+
+    if arabic_chars / total_alpha > 0.5:
+        # Arabic heuristic: vowel letters + diacritics as syllable nuclei.
+        vowel_letters = len(re.findall(r'[اوييىةآأإؤئ]', text))
+        diacritics = len(re.findall(r'[\u064B-\u0652]', text))  # fatHa → sukuun
+        count = max(1, vowel_letters + diacritics)
+        # Arabic words without diacritics: estimate ~2 syllables per whitespace token.
+        if diacritics == 0:
+            count = max(count, len(text.split()) * 2)
+        return count
+
+    # English / Latin heuristic: count vowel clusters.
+    text_lower = text.lower()
+    # Split on non-alpha to get words.
+    words = re.findall(r"[a-z']+", text_lower)
+    count = 0
+    for word in words:
+        # Count vowel groups.
+        vowel_groups = re.findall(r'[aeiouy]+', word)
+        n = len(vowel_groups)
+        # Silent trailing 'e' heuristic.
+        if word.endswith('e') and n > 1:
+            n -= 1
+        count += max(1, n)  # every word has at least 1 syllable
+    return max(1, count)
+
+
+def build_shortening_system_prompt(target_lang: str) -> str:
+    """
+    Dedicated system prompt for the isochrony shortening pass.
+    Separate from the main translation prompt — this is an *editing* task,
+    not a re-translation.
+    """
+    dialect_rule = ""
+    if target_lang == "ar":
+        dialect_rule = (
+            "7. You MUST output the shortened text strictly in Egyptian Arabic "
+            "(Masri) dialect. Do not use Modern Standard Arabic (MSA) under "
+            "any circumstances.\n"
+        )
+
+    return (
+        "You are a dubbing timing editor. Your ONLY job is to shorten a dubbed "
+        "line that is too long to fit its on-screen time window.\n\n"
+        "RULES:\n"
+        "1. Output ONLY the shortened line — no explanation, no alternatives, "
+        "no syllable counts, no quotes.\n"
+        "2. You must preserve: the speaker's meaning, emotional tone, register "
+        "(casual/formal), sarcasm, humor, and names.\n"
+        "3. Use everyday, conversational phrasing. Cut filler words, redundant "
+        "modifiers, and unnecessary clauses. Restructure freely.\n"
+        "4. The shortened line MUST be speakable in the given time budget. "
+        "Treat the syllable ceiling as a HARD LIMIT — never exceed it.\n"
+        "5. Do NOT add new information, pad the line, or explain what you "
+        "changed.\n"
+        "6. If the line is already at minimum viable meaning and cannot be "
+        "shortened further, output the shortest version you can.\n"
+        + dialect_rule
+    )
+
+
+def build_shortening_user_prompt(
+    overlong_text: str,
+    actual_syllables: int,
+    max_syllables: int,
+) -> str:
+    """User prompt with quantitative feedback for the shortening pass."""
+    return (
+        "The following dubbed line is too long for its time window.\n\n"
+        f"[OVERLONG LINE]: {overlong_text}\n"
+        f"[PROBLEM]: This line is approximately {actual_syllables} syllables, "
+        f"but the time window only allows at most {max_syllables} syllables.\n"
+        f"[REQUIRED]: Rewrite it in at most {max_syllables} syllables. "
+        "Keep the same meaning, tone, and speaker register."
+    )
+
+
+def shorten_single(
+    model,
+    tokenizer,
+    overlong_text: str,
+    actual_syllables: int,
+    max_syllables: int,
+    target_lang: str,
+    max_new_tokens: int = 256,
+) -> str:
+    """
+    Re-prompt the LLM with the overlong translation to compress it.
+    Uses a dedicated shortening prompt (not the main translation prompt).
+    Reuses the already-loaded model and tokenizer — no extra model loading.
+
+    Returns the shortened text, or the original if shortening fails.
+    """
+    system_content = build_shortening_system_prompt(target_lang)
+    user_content = build_shortening_user_prompt(
+        overlong_text, actual_syllables, max_syllables,
+    )
+
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.3,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    input_len = inputs["input_ids"].shape[1]
+    generated = outputs[0][input_len:]
+    result = tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+    # Strip chatbot leakage (same logic as translate_single).
+    result_lower = result.lower()
+    for pattern in LANGUAGES[target_lang]["leakage"]:
+        if result_lower.startswith(pattern):
+            for sep in [":\n", ":\r\n", "\n", ": ", " — ", " - "]:
+                if sep in result:
+                    result = result.split(sep, 1)[1].strip()
+                    break
+            break
+
+    # If the model returned garbage or [SKIP], keep the original.
+    if not result.strip() or result.strip() == "[SKIP]":
+        return overlong_text
+
+    return result
+
+
 def translate_segments(
     segments_data: dict,
     model_name: str,
@@ -617,10 +784,36 @@ def translate_segments(
             print(f"⏭ SKIPPED (model returned [SKIP])")
             continue
 
+        # ── QW-1: Post-translation length gate ────
+        # Catch egregious bloat that would cause >2× time-stretch.
+        target_syll, lo, hi = syllable_budget(seg.get("duration", 0.0))
+        actual_syll = estimate_syllables(translated)
+        length_gate_ceiling = int(hi * 1.5)
+
+        if actual_syll > length_gate_ceiling:
+            print(
+                f"✔ (overlong: ~{actual_syll} syll, budget ≤{hi}) → shortening… ",
+                end="", flush=True,
+            )
+            shortened = shorten_single(
+                model, tokenizer, translated,
+                actual_syll, hi, target_lang,
+            )
+            new_syll = estimate_syllables(shortened)
+            translated = shortened
+            seg["_length_gate"] = {
+                "original_syllables": actual_syll,
+                "shortened_syllables": new_syll,
+                "ceiling": hi,
+                "triggered": True,
+            }
+            print(f"✔ (~{new_syll} syll)")
+        else:
+            seg["_length_gate"] = {"triggered": False}
+
         seg["translated_text"] = translated
         # Record the isochrony budget this line was adapted against, for the
         # downstream time-stretch / QA stages.
-        target_syll, lo, hi = syllable_budget(seg.get("duration", 0.0))
         seg["syllable_budget"] = {"target": target_syll, "low": lo, "high": hi}
         translated_count += 1
 
@@ -628,7 +821,8 @@ def translate_segments(
         prev_text = text
 
         preview = translated[:55] + "…" if len(translated) > 55 else translated
-        print(f"✔ \"{preview}\"")
+        if not seg["_length_gate"]["triggered"]:
+            print(f"✔ \"{preview}\"")
 
     print(f"\n  Translated {translated_count}/{total} segments.")
     return segments_data
