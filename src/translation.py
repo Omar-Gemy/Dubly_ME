@@ -17,7 +17,6 @@ Usage:
 """
 
 import argparse
-import copy
 import json
 import os
 import string
@@ -157,6 +156,65 @@ def load_transcripts(path: str) -> dict:
     """Read the ASR-generated transcripts.json data contract."""
     with open(path, "r", encoding="utf-8") as fh:
         return json.load(fh)
+
+# Phase E needs stable routing/timing fields to select speaker references and
+# produce a TTS manifest. Phase D intentionally does not propagate Phase C
+# text, gate diagnostics, or Phase A/B metadata into translation.json.
+TRANSLATION_ROUTING_FIELDS = (
+    "segment_id",
+    "start_time",
+    "end_time",
+    "duration",
+    "speaker_id",
+)
+
+TRANSLATION_OUTPUT_FIELDS = (
+    "translated_text",
+    "skip_translation",
+    "transcription_failed",
+    "low_confidence",
+    "syllable_budget",
+)
+
+
+def build_translation_contract(
+    processed_transcripts: dict,
+    *,
+    source_language: str,
+    target_language: str,
+    translation_model: str,
+    name_glossary: dict,
+) -> dict:
+    """Build Phase D's minimal, independently owned output contract.
+
+    Phase D uses ASR text and gate flags while translating, but those are not
+    required by Phase E. The output therefore contains only stable routing
+    context plus Phase D's translation results and translation-specific QA
+    fields.
+    """
+    output_segments = []
+    for segment in processed_transcripts["segments"]:
+        output_segment = {
+            field: segment.get(field)
+            for field in TRANSLATION_ROUTING_FIELDS
+        }
+        output_segment.update(
+            {
+                field: segment.get(field)
+                for field in TRANSLATION_OUTPUT_FIELDS
+            }
+        )
+        output_segments.append(output_segment)
+
+    return {
+        "source_language": source_language,
+        "target_language": target_language,
+        "total_segments": len(output_segments),
+        "translation_model": translation_model,
+        "name_glossary": name_glossary,
+        "segments": output_segments,
+    }
+
 
 
 # ──────────────────────────────────────────────
@@ -635,10 +693,10 @@ def translate_segments(
 
 
 # ──────────────────────────────────────────────
-#  Step 4 — Save the enriched data contract
+#  Step 4 — Save the Phase D data contract
 # ──────────────────────────────────────────────
 def save_translation(data: dict, output_path: str) -> None:
-    """Write the translated segments to a JSON file (UTF-8, pretty-printed)."""
+    """Write the independent Phase D contract (UTF-8, pretty-printed)."""
     data["translation_completed_at"] = datetime.now(timezone.utc).isoformat()
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -723,8 +781,6 @@ def main() -> None:
                   f"Supported: {', '.join(sorted(LANGUAGES))}")
             sys.exit(1)
     # Persist the actual pair used so downstream TTS reads a correct target.
-    data["source_language"] = source_lang
-    data["target_language"] = target_lang
     print(f"       Language matrix: {source_lang} → {target_lang}")
 
     # ── Load name glossary (non-fatal) ───────
@@ -743,18 +799,26 @@ def main() -> None:
 
     # ── Step 4: Save output ──────────────────
     print(f"\n[4/4]  Saving translation → {args.output}")
-    data["translation_model"] = args.model
-    # Additive contract field — records glossary provenance for this run.
-    data["name_glossary"] = {
-        "path": None if args.no_glossary else str(args.glossary),
-        "entries": len(glossary),
-        "applied": [e["en"] for e in glossary],
-    }
-    save_translation(data, args.output)
+    translation_contract = build_translation_contract(
+        data,
+        source_language=source_lang,
+        target_language=target_lang,
+        translation_model=args.model,
+        name_glossary={
+            "path": None if args.no_glossary else str(args.glossary),
+            "entries": len(glossary),
+            "applied": [e["en"] for e in glossary],
+        },
+    )
+    save_translation(translation_contract, args.output)
 
     # ── Summary ──────────────────────────────
-    translated = sum(1 for s in data["segments"] if s.get("translated_text"))
-    skipped = sum(1 for s in data["segments"] if s.get("skip_translation"))
+    translated = sum(
+        1 for s in translation_contract["segments"] if s.get("translated_text")
+    )
+    skipped = sum(
+        1 for s in translation_contract["segments"] if s.get("skip_translation")
+    )
 
     print()
     print(f"{'═' * 60}")
@@ -766,7 +830,9 @@ def main() -> None:
     print(f"{'═' * 60}")
 
     # Preview skipped segments for quick QA
-    skipped_segs = [s for s in data["segments"] if s.get("skip_translation")]
+    skipped_segs = [
+        s for s in translation_contract["segments"] if s.get("skip_translation")
+    ]
     if skipped_segs:
         print(f"\n  Skipped segments detail:")
         for seg in skipped_segs:

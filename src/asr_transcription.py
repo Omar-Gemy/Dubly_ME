@@ -144,6 +144,71 @@ def load_segments(segments_path: str) -> dict:
     with open(segments_path, "r", encoding="utf-8") as fh:
         return json.load(fh)
 
+# Only this routing context is carried from Phase B into the Phase C contract.
+# Phase C deliberately does not copy Phase A/B run metadata (VAD parameters,
+# diarization stats, etc.) into transcripts.json.
+TRANSCRIPT_ROUTING_FIELDS = (
+    "segment_id",
+    "start_time",
+    "end_time",
+    "duration",
+    "speaker_id",
+)
+
+# These fields are produced by Phase C and are consumed by Phase D's
+# pre-processing guards or retained as ASR diagnostics.
+TRANSCRIPT_ASR_FIELDS = (
+    "text",
+    "asr_confidence",
+    "low_confidence_asr",
+    "_rms_dbfs",
+    "_skipped_low_energy",
+    "_skipped_too_short",
+    "_hallucination_suspect",
+    "_prompt_echo_filtered",
+)
+
+
+def build_transcript_contract(
+    processed_segments_data: dict,
+    *,
+    asr_model: str,
+    align_model: str,
+) -> dict:
+    """Build Phase C's minimal, independently owned output contract.
+
+    The ASR worker may enrich the loaded Phase B data in memory while it
+    assigns words and applies gates. This projection is the contract
+    boundary: it carries only segment routing context required by Phase D and
+    Phase C's own ASR payload. Upstream VAD and diarization run metadata is
+    intentionally excluded.
+    """
+    output_segments = []
+    for segment in processed_segments_data["segments"]:
+        output_segment = {
+            field: segment.get(field)
+            for field in TRANSCRIPT_ROUTING_FIELDS
+        }
+        output_segment.update(
+            {
+                field: segment.get(field)
+                for field in TRANSCRIPT_ASR_FIELDS
+            }
+        )
+        output_segments.append(output_segment)
+
+    return {
+        "source_language": processed_segments_data.get("source_language"),
+        "target_language": processed_segments_data.get("target_language"),
+        "total_segments": len(output_segments),
+        "language_config": processed_segments_data.get("language_config", {}),
+        "gate_stats": processed_segments_data.get("gate_stats", {}),
+        "asr_model": asr_model,
+        "align_model": align_model,
+        "segments": output_segments,
+    }
+
+
 
 # ──────────────────────────────────────────────
 #  Anti-hallucination guards
@@ -622,10 +687,10 @@ def transcribe_full_file(
 
 
 # ──────────────────────────────────────────────
-#  Step 4 — Save the enriched data contract
+#  Step 4 — Save the Phase C data contract
 # ──────────────────────────────────────────────
 def save_transcripts(data: dict, output_path: str) -> None:
-    """Write the transcribed segments to a JSON file (UTF-8, pretty-printed)."""
+    """Write the independent Phase C contract (UTF-8, pretty-printed)."""
     data["asr_completed_at"] = datetime.now(timezone.utc).isoformat()
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -749,7 +814,7 @@ def main() -> None:
 
     # ── Steps 2–3: Transcribe + align + map ──
     print(f"\n[2/3]  Transcribing with WhisperX (model={args.model})…\n")
-    segments_data = transcribe_full_file(
+    processed_segments_data = transcribe_full_file(
         args.input_audio,
         segments_data,
         model_size=args.model,
@@ -767,12 +832,15 @@ def main() -> None:
 
     # ── Step 4: Save output ──────────────────
     print(f"\n[3/3]  Saving transcripts → {args.output}")
-    segments_data["asr_model"] = f"whisperx/{args.model}"
-    segments_data["align_model"] = args.align_model or "whisperx-default"
-    save_transcripts(segments_data, args.output)
+    transcript_contract = build_transcript_contract(
+        processed_segments_data,
+        asr_model=f"whisperx/{args.model}",
+        align_model=args.align_model or "whisperx-default",
+    )
+    save_transcripts(transcript_contract, args.output)
 
     # ── Summary ──────────────────────────────
-    filled = sum(1 for s in segments_data["segments"] if s.get("text"))
+    filled = sum(1 for s in transcript_contract["segments"] if s.get("text"))
     empty = n_segs - filled
 
     print()
