@@ -39,6 +39,8 @@ from typing import Optional
 import torch
 import torchaudio
 
+import pipeline_core
+
 # WhisperX 3.3.1 forces pyannote.audio 3.1.1, which breaks on recent torchaudio
 # (missing torchaudio.AudioMetaData). Patch it before pyannote is imported.
 import torchaudio_compat
@@ -57,16 +59,17 @@ log = logging.getLogger("diarization")
 # ──────────────────────────────────────────────
 #  Project paths (relative to repo root)
 # ──────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
+PROJECT_ROOT = pipeline_core.PROJECT_ROOT
+ARTIFACTS_DIR = pipeline_core.ARTIFACTS_DIR
 SEGMENTS_FILE = ARTIFACTS_DIR / "segments.json"
-DEFAULT_AUDIO = PROJECT_ROOT / "data" / "audio_out" / "_temp_normalised.wav"
+DEFAULT_AUDIO = pipeline_core.DATA_AUDIO_OUT / "_temp_normalised.wav"
 
 # ──────────────────────────────────────────────
 #  Constants
 # ──────────────────────────────────────────────
 MIN_SUB_SEGMENT_SEC = 0.3   # sub-segments shorter than this are merged
 PYANNOTE_PIPELINE_ID = "pyannote/speaker-diarization-3.1"
+MIN_FREE_VRAM_GB = 1.5      # pyannote needs ~1.5–2.5 GB; below this → CPU
 
 # A VAD segment is only split across speakers when a SECONDARY speaker's
 # coverage is substantial — otherwise a brief diarization boundary error would
@@ -161,22 +164,23 @@ def resolve_device(requested: str) -> torch.device:
 
     If CUDA is requested but unavailable or has < 1.5 GB free,
     falls back to CPU with a warning.
+
+    CUDA probing is delegated to pipeline_core (5.6); the 1.5 GB floor and the
+    reporting below stay here because they are specific to pyannote's budget.
     """
     if requested == "cpu":
         log.info("Device: CPU (explicitly requested)")
         return torch.device("cpu")
 
-    if not torch.cuda.is_available():
+    if not pipeline_core.cuda_available():
         log.warning("CUDA not available — falling back to CPU.")
         return torch.device("cpu")
 
     # VRAM safety check
-    free_bytes, total_bytes = torch.cuda.mem_get_info()
-    free_gb = free_bytes / (1024 ** 3)
-    total_gb = total_bytes / (1024 ** 3)
+    free_gb, total_gb = pipeline_core.cuda_memory_gb()
     log.info("GPU VRAM: %.2f GB free / %.2f GB total", free_gb, total_gb)
 
-    if free_gb < 1.5:
+    if free_gb < MIN_FREE_VRAM_GB:
         log.warning(
             "Only %.2f GB VRAM free — pyannote needs ~1.5–2.5 GB. "
             "Falling back to CPU. Close other GPU applications to use CUDA.",
@@ -207,7 +211,7 @@ def load_diarization_pipeline(
         log.error(
             "pyannote.audio is not installed.\n"
             "  Install it with:  pip install 'pyannote.audio>=4.0'\n"
-            "  Or run:           pip install -r requirements.txt"
+            "  Or run:           pip install -r requirements/asr.txt"
         )
         sys.exit(1)
 
@@ -773,8 +777,11 @@ def run_phase_b(
 #  CLI entry-point
 # ══════════════════════════════════════════════
 def main() -> None:
+    # UTF-8 stdio before the first banner: the box-drawing glyphs below die on
+    # a cp1252 fallback when stdout is piped or redirected (Windows).
+    pipeline_core.enable_utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="Dubly ME — Phase B: Speaker Diarization (pyannote.audio 4.x)",
+        description=f"Dubly ME — {pipeline_core.phase_title('B')} (pyannote.audio)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -875,7 +882,7 @@ def main() -> None:
     stats = segments_data["diarization_stats"]
     print()
     print(f"{'═' * 58}")
-    print(f"  ✅  Phase B: Speaker Diarization Complete")
+    print(f"  ✅  Phase B complete — {pipeline_core.PHASES['B']['label']}")
     print(f"{'─' * 58}")
     print(f"  Model             : {PYANNOTE_PIPELINE_ID}")
     print(f"  Device            : {device}")

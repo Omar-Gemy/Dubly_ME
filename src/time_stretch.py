@@ -1,6 +1,6 @@
 """
-time_stretch.py — Phase F, Step 1: Duration Fitting via Time-Stretching
-========================================================================
+time_stretch.py — Phase F1: Duration Fitting via Time-Stretching
+================================================================
 Fit synthesised TTS segments into the original timing budget using
 high-quality WSOLA time-stretching (pyrubberband / FFmpeg atempo).
 
@@ -16,7 +16,7 @@ Inputs:
 
 Outputs:
   - artifacts/audio_out/stretched/segment_XXX.wav  (time-fitted WAVs)
-  - artifacts/stretch_manifest.json                (Phase F Step 1 data contract)
+  - artifacts/stretch_manifest.json                (Phase F1 data contract)
 
 Usage:
   python src/time_stretch.py
@@ -25,11 +25,9 @@ Usage:
 
 import argparse
 import json
-import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,22 +35,32 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+import pipeline_core
+
 # ──────────────────────────────────────────────
 #  Project paths
 # ──────────────────────────────────────────────
-PROJECT_ROOT    = Path(__file__).resolve().parent.parent
-ARTIFACTS_DIR   = PROJECT_ROOT / "artifacts"
+PROJECT_ROOT    = pipeline_core.PROJECT_ROOT
+ARTIFACTS_DIR   = pipeline_core.ARTIFACTS_DIR
 AUDIO_OUT_DIR   = ARTIFACTS_DIR / "audio_out"
 STRETCHED_DIR   = AUDIO_OUT_DIR / "stretched"
 TTS_MANIFEST    = ARTIFACTS_DIR / "tts_manifest.json"
 STRETCH_MANIFEST = ARTIFACTS_DIR / "stretch_manifest.json"
+
+# Phase F1 is rate-PRESERVING by design: it never declares a sample rate of its
+# own, so Phase E's rate passes straight through to Phase F2, which owns the
+# single documented conversion to pipeline_core.PIPELINE_SAMPLE_RATE (5.5).
 
 # ──────────────────────────────────────────────
 #  Constants
 # ──────────────────────────────────────────────
 MAX_STRETCH_RATIO   = 2.0     # Never compress beyond 2.0× (Q1 decision)
 TIER1_THRESHOLD     = 1.15    # Below this ratio → trivial / no-stretch
-FIT_TOLERANCE       = 0.05    # 50ms tolerance — segment "fits" if within this
+# RELATIVE tolerance (5%), NOT seconds — despite the "±50ms" banner below and
+# the `fit_tolerance_s` manifest key, both of which are wrong. Renaming the key
+# and making the metric two-sided is audit 6.2, scheduled for Chunk 6; Chunk 1
+# only records the truth here so nobody tunes it on the wrong assumption.
+FIT_TOLERANCE       = 0.05
 
 # Over-cap segments get a short fade-out on the trimmed tail to de-click the
 # overflow edge (audit #27).
@@ -325,7 +333,6 @@ def process_segment(
     # ── No stretch needed ────────────────────
     if tier == "no-stretch":
         # Just copy the file as-is
-        import shutil
         output_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(input_file), str(out_path))
         output_duration = tts_duration
@@ -359,9 +366,7 @@ def process_segment(
                 "segment_id": seg_id,
                 "status": "error",
                 "error": str(e),
-                "input_file": str(
-                    input_file.relative_to(PROJECT_ROOT)
-                ).replace("\\", "/"),
+                "input_file": pipeline_core.rel_or_abs(input_file),
                 "output_file": None,
                 "original_duration_s": orig_duration,
                 "tts_duration_s": tts_duration,
@@ -375,12 +380,8 @@ def process_segment(
     return {
         "segment_id": seg_id,
         "status": "success",
-        "input_file": str(
-            input_file.relative_to(PROJECT_ROOT)
-        ).replace("\\", "/"),
-        "output_file": str(
-            out_path.relative_to(PROJECT_ROOT)
-        ).replace("\\", "/"),
+        "input_file": pipeline_core.rel_or_abs(input_file),
+        "output_file": pipeline_core.rel_or_abs(out_path),
         "original_duration_s": orig_duration,
         "tts_duration_s": tts_duration,
         "output_duration_s": output_duration,
@@ -491,8 +492,11 @@ def save_stretch_manifest(
 #  CLI entry-point
 # ──────────────────────────────────────────────
 def main() -> None:
+    # UTF-8 stdio before the first banner: the box-drawing glyphs below die on
+    # a cp1252 fallback when stdout is piped or redirected (Windows).
+    pipeline_core.enable_utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="Dubly ME — Phase F, Step 1: Time-Stretching",
+        description=f"Dubly ME — {pipeline_core.phase_title('F1')}",
     )
     parser.add_argument(
         "--input",
@@ -516,7 +520,7 @@ def main() -> None:
 
     print()
     print(f"{'═' * 60}")
-    print(f"  Dubly ME — Phase F, Step 1: Time-Stretching")
+    print(f"  Dubly ME — {pipeline_core.phase_title('F1')}")
     print(f"{'═' * 60}")
 
     # ── Validate input ───────────────────────
@@ -537,7 +541,7 @@ def main() -> None:
 
     print()
     print(f"{'═' * 60}")
-    print(f"  ✅  Phase F Step 1 complete — Time-Stretching")
+    print(f"  ✅  Phase F1 complete — {pipeline_core.PHASES['F1']['label']}")
     print(f"{'─' * 60}")
     print(f"  Stretched segments : {success}/{len(results)}")
     print(f"  Output directory   : {STRETCHED_DIR}")

@@ -1,47 +1,26 @@
-# Dubly ME — Phase B & C: Speaker Layer + ASR
-# Requirements for Windows Environment
-
-torch==2.1.2
-torchaudio==2.1.2
-numpy<2.0
-packaging
-soundfile
-
-# Phase B: Speaker Diarization (pyannote.audio)
-# ⚠ SETUP REQUIRED before first use:
-#   1. Create a Hugging Face account at https://huggingface.co
-#   2. Accept the license at https://huggingface.co/pyannote/speaker-diarization-3.1
-#   3. Accept the license at https://huggingface.co/pyannote/segmentation-3.0
-#   4. Set your token:  $env:HF_TOKEN = "hf_your_token_here"  (PowerShell)
-# pyannote.audio is NOT pinned here — whisperx==3.3.1 pulls the compatible
-# 3.1.1 transitively (an explicit 4.x pin conflicts with it). The 3.1.1 ↔
-# new-torchaudio break is handled at runtime by src/torchaudio_compat.py.
-
-# Phase C: ASR / Transcription
-# WhisperX handles full-file transcription + wav2vec2 forced alignment and
-# pins compatible faster-whisper / ctranslate2 versions transitively — do NOT
-# pin faster-whisper here (it conflicts with whisperx 3.3.1's own pin).
-whisperx==3.3.1
-
-# Phase D: Translation & Adaptation (offline LLM)
-# Pinned so AutoAWQ (0.2.8) and WhisperX share one transformers build:
-# transformers is held at 4.47.1 so transformers.activations.PytorchGELUTanh
-# (imported by AutoAWQ) still exists — it was removed in 4.49.
-transformers==4.47.1
-accelerate>=1.1.0,<1.3.0
-bitsandbytes>=0.44.0   # 4-bit quantization support
-autoawq==0.2.8         # AWQ 4-bit inference for Qwen2.5-14B-Instruct-AWQ (GPU/Linux)
-sentencepiece          # tokenizer backend for some models
-
-# Phase E: Voice Cloning & TTS
-TTS                # Coqui TTS — includes XTTS v2
-soundfile          # audio I/O for WAV verification
-
-# Phase F: Mix & Render (post-processing)
-numpy<2.0           # audio timeline assembly & signal processing
-
-# FFmpeg is a SYSTEM dependency — not installed via pip.
-# Install it separately and ensure it is on PATH:
-#    Windows : winget install FFmpeg
-#    macOS   : brew install ffmpeg
-#    Linux   : sudo apt install ffmpeg
+# Dubly ME — dependency index  (NOT directly installable)
+# ═════════════════════════════════════════════════════════════════
+# This file used to list EVERY dependency across all three virtualenvs in one
+# flat set. Installing it into a single environment reproduced exactly the
+# resolver conflicts the 3-venv design exists to avoid (torch 2.1.2 for the
+# pinned ASR stack vs. whatever CUDA build the LLM/TTS stacks need). It is now
+# an index only — deliberately empty of requirements (audit: flat-requirements
+# warning in architecture_data_flow_map.md §7).
+#
+# Install the venv you actually need:
+#
+#   requirements/asr.txt      Venv 1 — Phases A, B, C   (torch 2.1.2, whisperx)
+#   requirements/llm.txt      Venv 2 — Phase D          (transformers 4.47.1, autoawq)
+#   requirements/audio.txt    Venv 3 — Phases E, F1–F3  (Coqui TTS, scipy, pyrubberband)
+#   requirements/demucs.txt   Venv 4 — Phase F0         (demucs)
+#
+#   requirements-colab.txt    Colab base kernel only (ASR + LLM co-installed);
+#                             the TTS and Demucs venvs are built separately by
+#                             the notebook's setup cells.
+#
+# System dependencies (never pip): FFmpeg, and rubberband-cli for Phase F1's
+# preferred time-stretch engine.
+#
+# Orchestration: src/run_pipeline.py resolves one interpreter per venv via
+#   --python-asr / --python-llm / --python-audio / --python-demucs
+# or the matching DUBLY_PY_* environment variables.

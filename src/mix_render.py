@@ -1,6 +1,6 @@
 """
-mix_render.py — Phase F, Step 2: Final Audio Mix & Video Render
-================================================================
+mix_render.py — Phase F2: Final Audio Mix & Video Render
+========================================================
 Assemble the time-stretched dubbed segments into a full-length
 audio track, mix with the original video, and export the final
 dubbed video.
@@ -13,7 +13,7 @@ Strategy (approved by Tech Lead):
   - Crossfade transitions to avoid clicks at segment boundaries
 
 Inputs:
-  - artifacts/stretch_manifest.json   (Phase F Step 1 data contract)
+  - artifacts/stretch_manifest.json   (Phase F1 data contract)
   - artifacts/segments.json           (Phase B data contract — timing info)
   - artifacts/audio_out/stretched/    (time-fitted WAV segments)
   - data/audio_in/sample.mp4         (source video)
@@ -21,7 +21,7 @@ Inputs:
 Outputs:
   - data/audio_out/final_dubbed.wav   (full-length dubbed audio)
   - data/audio_out/final_dubbed.mp4   (final video with dubbed audio track)
-  - artifacts/mix_manifest.json       (Phase F Step 2 data contract)
+  - artifacts/mix_manifest.json       (Phase F2 data contract)
 
 Usage:
   python src/mix_render.py
@@ -39,31 +39,35 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-try:
-    from scipy.signal import resample_poly
-    _HAVE_SCIPY = True
-except Exception:
-    _HAVE_SCIPY = False
+import pipeline_core
 
 # ──────────────────────────────────────────────
 #  Project paths
 # ──────────────────────────────────────────────
-PROJECT_ROOT       = Path(__file__).resolve().parent.parent
-ARTIFACTS_DIR      = PROJECT_ROOT / "artifacts"
+PROJECT_ROOT       = pipeline_core.PROJECT_ROOT
+ARTIFACTS_DIR      = pipeline_core.ARTIFACTS_DIR
 AUDIO_OUT_DIR      = ARTIFACTS_DIR / "audio_out"
 STRETCHED_DIR      = AUDIO_OUT_DIR / "stretched"
-DATA_AUDIO_IN      = PROJECT_ROOT / "data" / "audio_in"
-DATA_AUDIO_OUT     = PROJECT_ROOT / "data" / "audio_out"
+DATA_AUDIO_IN      = pipeline_core.DATA_AUDIO_IN
+DATA_AUDIO_OUT     = pipeline_core.DATA_AUDIO_OUT
 
 DEFAULT_SOURCE     = DATA_AUDIO_IN / "sample.mp4"
 SEGMENTS_FILE      = ARTIFACTS_DIR / "segments.json"
 STRETCH_MANIFEST   = ARTIFACTS_DIR / "stretch_manifest.json"
 MIX_MANIFEST       = ARTIFACTS_DIR / "mix_manifest.json"
 
+# Path + resample helpers are shared with source_separation (5.6).
+_rel_or_abs = pipeline_core.rel_or_abs
+_resample = pipeline_core.resample
+
 # ──────────────────────────────────────────────
 #  Audio constants
 # ──────────────────────────────────────────────
-SAMPLE_RATE        = 24000     # XTTS v2 native output rate → dubbed segs need no resample
+# Timeline assembly rate, declared once in pipeline_core (5.5). NOTE: this is
+# NOT XTTS v2's native rate — XTTS emits 22050 Hz, so every dubbed segment IS
+# resampled 22050 → 24000 on placement below. The previous comment here claimed
+# dubbed segments needed no resample, which was incorrect.
+SAMPLE_RATE        = pipeline_core.PIPELINE_SAMPLE_RATE
 CROSSFADE_MS       = 30        # Equal-power crossfade at real segment overlaps
 DECLICK_MS         = 5         # Tiny head/tail fade to kill boundary pops
 AAC_BITRATE        = "192k"    # Q4 decision: AAC 192k
@@ -140,28 +144,6 @@ def get_source_total_duration(source_video: Path) -> float:
 # ──────────────────────────────────────────────
 #  Step 2 — Build the full-length audio timeline
 # ──────────────────────────────────────────────
-def _resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-    """
-    Anti-aliased resample. Uses scipy polyphase (resample_poly) when available;
-    falls back to linear interpolation only if scipy is missing. At the 24 kHz
-    pipeline rate, dubbed segments already match and skip this entirely.
-    """
-    if src_sr == dst_sr:
-        return audio.astype(np.float32, copy=False)
-    if _HAVE_SCIPY:
-        from math import gcd
-        g = gcd(src_sr, dst_sr)
-        return resample_poly(audio, dst_sr // g, src_sr // g).astype(np.float32)
-    # Fallback: linear interpolation (aliasing-prone) — kept only for safety.
-    old_len = len(audio)
-    new_len = int(old_len * dst_sr / src_sr)
-    return np.interp(
-        np.linspace(0, old_len - 1, new_len),
-        np.arange(old_len),
-        audio,
-    ).astype(np.float32)
-
-
 def apply_crossfade(
     audio: np.ndarray,
     position: int,
@@ -268,7 +250,7 @@ def build_audio_timeline(
             # Read the audio segment
             audio_data, sr = sf.read(str(wav_path), dtype="float32")
 
-            # Resample to the pipeline rate if needed (dubbed = 24 kHz → no-op)
+            # Resample to the pipeline rate (XTTS 22050 → timeline 24000).
             if sr != SAMPLE_RATE:
                 audio_data = _resample(audio_data, sr, SAMPLE_RATE)
 
@@ -537,18 +519,6 @@ def render_final_video(
 # ──────────────────────────────────────────────
 #  Save mix manifest
 # ──────────────────────────────────────────────
-def _rel_or_abs(path: Path) -> str:
-    """
-    Return the path relative to PROJECT_ROOT when it lives inside the repo,
-    otherwise fall back to the absolute path. The source video may sit outside
-    the repo (e.g. on Google Drive), where relative_to() would raise.
-    """
-    try:
-        return str(path.relative_to(PROJECT_ROOT)).replace("\\", "/")
-    except ValueError:
-        return str(path).replace("\\", "/")
-
-
 def save_mix_manifest(
     placement_log: list[dict],
     output_audio: Path,
@@ -573,12 +543,8 @@ def save_mix_manifest(
         "sample_rate": SAMPLE_RATE,
         "crossfade_ms": CROSSFADE_MS,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "output_audio": str(
-            output_audio.relative_to(PROJECT_ROOT)
-        ).replace("\\", "/"),
-        "output_video": str(
-            output_video.relative_to(PROJECT_ROOT)
-        ).replace("\\", "/"),
+        "output_audio": _rel_or_abs(output_audio),
+        "output_video": _rel_or_abs(output_video),
         "total_segments_placed": len(placement_log),
         "dubbed_segments": dubbed_count,
         "arabic_passthrough": passthrough_count,
@@ -600,8 +566,11 @@ def save_mix_manifest(
 #  CLI entry-point
 # ──────────────────────────────────────────────
 def main() -> None:
+    # UTF-8 stdio before the first banner: the box-drawing glyphs below die on
+    # a cp1252 fallback when stdout is piped or redirected (Windows).
+    pipeline_core.enable_utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="Dubly ME — Phase F, Step 2: Final Mix & Video Render",
+        description=f"Dubly ME — {pipeline_core.phase_title('F2')}",
     )
     parser.add_argument(
         "--source",
@@ -646,7 +615,7 @@ def main() -> None:
 
     print()
     print(f"{'═' * 60}")
-    print(f"  Dubly ME — Phase F, Step 2: Final Mix & Video Render")
+    print(f"  Dubly ME — {pipeline_core.phase_title('F2')}")
     print(f"{'═' * 60}")
 
     # ── Validate inputs ──────────────────────
@@ -765,7 +734,7 @@ def main() -> None:
 
     print()
     print(f"{'═' * 60}")
-    print(f"  ✅  Phase F Step 2 complete — Mix & Render")
+    print(f"  ✅  Phase F2 complete — {pipeline_core.PHASES['F2']['label']}")
     print(f"{'─' * 60}")
     print(f"  Dubbed segments      : {dubbed}")
     print(f"  Arabic passthrough   : {passthrough}")

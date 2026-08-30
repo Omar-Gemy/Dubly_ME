@@ -1,6 +1,6 @@
 """
-ingestion_vad.py — Phase B: Speaker Layer
-==========================================
+ingestion_vad.py — Phase A: Ingestion & VAD
+===========================================
 Audio ingestion and Voice Activity Detection (VAD) using the
 self-hosted Silero VAD model.  No third-party APIs are used.
 
@@ -22,25 +22,29 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
 import torch
 import torchaudio
 
+import pipeline_core
+
 # ──────────────────────────────────────────────
 #  Project paths (relative to repo root)
 # ──────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
+PROJECT_ROOT = pipeline_core.PROJECT_ROOT
+ARTIFACTS_DIR = pipeline_core.ARTIFACTS_DIR
 SEGMENTS_FILE = ARTIFACTS_DIR / "segments.json"
-AUDIO_OUT_DIR = PROJECT_ROOT / "data" / "audio_out"
+AUDIO_OUT_DIR = pipeline_core.DATA_AUDIO_OUT
+
+# Silero VAD / WhisperX operating rate — declared once in pipeline_core (5.5).
+SAMPLE_RATE = pipeline_core.ASR_SAMPLE_RATE
 
 # ──────────────────────────────────────────────
 #  Custom read_audio  (Windows-safe replacement
 #  for Silero's utils_vad.read_audio which uses
 #  sox_effects — unsupported on Windows)
 # ──────────────────────────────────────────────
-def read_audio(path: str, sampling_rate: int = 16000) -> torch.Tensor:
+def read_audio(path: str, sampling_rate: int = SAMPLE_RATE) -> torch.Tensor:
     """
     Read an audio file and return a 1-D float32 torch.Tensor,
     resampled to *sampling_rate* if necessary.
@@ -72,7 +76,7 @@ def read_audio(path: str, sampling_rate: int = 16000) -> torch.Tensor:
 def extract_and_normalize_audio(
     input_path: str,
     output_path: str,
-    sample_rate: int = 16000,
+    sample_rate: int = SAMPLE_RATE,
     target_i: float = -16.0,
     target_tp: float = -1.5,
     target_lra: float = 11.0,
@@ -199,7 +203,7 @@ def run_vad(
     # we intentionally skip Silero's read_audio (sox-dependent)
     # and use our own Windows-safe implementation instead.
     (get_speech_timestamps, *_rest) = utils
-    SAMPLING_RATE = 16000
+    SAMPLING_RATE = SAMPLE_RATE
 
     wav = read_audio(audio_path, sampling_rate=SAMPLING_RATE)
 
@@ -272,8 +276,11 @@ def save_segments(data: dict, output_path: str) -> None:
 #  CLI entry-point
 # ──────────────────────────────────────────────
 def main() -> None:
+    # UTF-8 stdio before the first banner: the box-drawing glyphs below die on
+    # a cp1252 fallback when stdout is piped or redirected (Windows).
+    pipeline_core.enable_utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="Dubly ME — Audio Ingestion & Voice Activity Detection",
+        description=f"Dubly ME — {pipeline_core.phase_title('A')}",
     )
     parser.add_argument(
         "input",

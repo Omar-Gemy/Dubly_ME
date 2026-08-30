@@ -4,6 +4,7 @@ __pycache__/
 
 # Artifacts & Data
 artifacts/
+baselines/
 data/audio_in/*
 !data/audio_in/.gitkeep
 data/audio_out/*

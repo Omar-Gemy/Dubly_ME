@@ -1,6 +1,6 @@
 """
-qa_report.py — Phase F, Step 3: Timing QA Report
-==================================================
+qa_report.py — Phase F3: Timing QA Report
+=========================================
 Generate a human-readable QA report summarising the dubbing
 pipeline results, with focus on timing accuracy, stretch ratios,
 and quality flags.
@@ -13,8 +13,8 @@ Strategy (approved by Tech Lead):
 
 Inputs:
   - artifacts/tts_manifest.json       (Phase E data contract)
-  - artifacts/stretch_manifest.json   (Phase F Step 1 data contract)
-  - artifacts/mix_manifest.json       (Phase F Step 2 data contract)
+  - artifacts/stretch_manifest.json   (Phase F1 data contract)
+  - artifacts/mix_manifest.json       (Phase F2 data contract)
   - artifacts/segments.json           (Phase B data contract)
 
 Outputs:
@@ -27,15 +27,16 @@ Usage:
 
 import argparse
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+import pipeline_core
 
 # ──────────────────────────────────────────────
 #  Project paths
 # ──────────────────────────────────────────────
-PROJECT_ROOT     = Path(__file__).resolve().parent.parent
-ARTIFACTS_DIR    = PROJECT_ROOT / "artifacts"
+PROJECT_ROOT     = pipeline_core.PROJECT_ROOT
+ARTIFACTS_DIR    = pipeline_core.ARTIFACTS_DIR
 
 SEGMENTS_FILE    = ARTIFACTS_DIR / "segments.json"
 TTS_MANIFEST     = ARTIFACTS_DIR / "tts_manifest.json"
@@ -440,8 +441,11 @@ def save_reports(
 #  CLI entry-point
 # ──────────────────────────────────────────────
 def main() -> None:
+    # UTF-8 stdio before the first banner: the box-drawing glyphs below die on
+    # a cp1252 fallback when stdout is piped or redirected (Windows).
+    pipeline_core.enable_utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="Dubly ME — Phase F, Step 3: QA Report",
+        description=f"Dubly ME — {pipeline_core.phase_title('F3')}",
     )
     parser.add_argument(
         "--output-json",
@@ -457,7 +461,7 @@ def main() -> None:
 
     print()
     print(f"{'═' * 60}")
-    print(f"  Dubly ME — Phase F, Step 3: QA Report")
+    print(f"  Dubly ME — {pipeline_core.phase_title('F3')}")
     print(f"{'═' * 60}")
 
     # ── Load manifests ───────────────────────
@@ -483,7 +487,7 @@ def main() -> None:
     # ── Final banner ─────────────────────────
     print()
     print(f"{'═' * 60}")
-    print(f"  ✅  Phase F Step 3 complete — QA Report")
+    print(f"  ✅  Phase F3 complete — {pipeline_core.PHASES['F3']['label']}")
     print(f"{'─' * 60}")
     print(f"  JSON report  : {args.output_json}")
     print(f"  MD report    : {args.output_md}")

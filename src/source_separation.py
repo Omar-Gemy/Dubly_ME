@@ -32,7 +32,6 @@ Usage:
 
 import argparse
 import json
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -43,19 +42,15 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-try:
-    from scipy.signal import resample_poly
-    _HAVE_SCIPY = True
-except Exception:
-    _HAVE_SCIPY = False
+import pipeline_core
 
 # ──────────────────────────────────────────────
 #  Project paths
 # ──────────────────────────────────────────────
-PROJECT_ROOT   = Path(__file__).resolve().parent.parent
-ARTIFACTS_DIR  = PROJECT_ROOT / "artifacts"
+PROJECT_ROOT   = pipeline_core.PROJECT_ROOT
+ARTIFACTS_DIR  = pipeline_core.ARTIFACTS_DIR
 AUDIO_OUT_DIR  = ARTIFACTS_DIR / "audio_out"
-DATA_AUDIO_IN  = PROJECT_ROOT / "data" / "audio_in"
+DATA_AUDIO_IN  = pipeline_core.DATA_AUDIO_IN
 
 DEFAULT_SOURCE   = DATA_AUDIO_IN / "sample.mp4"
 DEFAULT_BG       = AUDIO_OUT_DIR / "background.wav"
@@ -66,54 +61,20 @@ DEFAULT_MANIFEST = ARTIFACTS_DIR / "separation_manifest.json"
 #  Constants
 # ──────────────────────────────────────────────
 DEMUCS_MODEL   = "htdemucs"   # hybrid-transformer Demucs v4 (2-stem, fast, ~80MB)
-EXTRACT_RATE   = 44100        # Demucs native working rate
-PIPELINE_RATE  = 24000        # must match mix_render.SAMPLE_RATE (Phase 3A)
+# Rates declared once in pipeline_core (5.5): Demucs works at 44.1 kHz, stems
+# are finalised at the shared timeline rate mix_render assembles at.
+EXTRACT_RATE   = pipeline_core.SEPARATION_WORK_RATE
+PIPELINE_RATE  = pipeline_core.PIPELINE_SAMPLE_RATE
 
-
-def _rel_or_abs(path: Path) -> str:
-    """
-    Path relative to PROJECT_ROOT when inside the repo, else the absolute path.
-    The source video may sit outside the repo (e.g. on Google Drive), where
-    relative_to() would raise.
-    """
-    try:
-        return str(Path(path).relative_to(PROJECT_ROOT)).replace("\\", "/")
-    except ValueError:
-        return str(path).replace("\\", "/")
-
-
-def _resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-    """
-    Anti-aliased resample. scipy polyphase (resample_poly) when available; falls
-    back to linear interpolation only if scipy is missing. Mirrors mix_render.
-    """
-    if src_sr == dst_sr:
-        return audio.astype(np.float32, copy=False)
-    if _HAVE_SCIPY:
-        from math import gcd
-        g = gcd(src_sr, dst_sr)
-        return resample_poly(audio, dst_sr // g, src_sr // g).astype(np.float32)
-    old_len = len(audio)
-    new_len = int(old_len * dst_sr / src_sr)
-    return np.interp(
-        np.linspace(0, old_len - 1, new_len),
-        np.arange(old_len),
-        audio,
-    ).astype(np.float32)
+# Path + resample helpers are shared with mix_render via pipeline_core (5.6).
+_rel_or_abs = pipeline_core.rel_or_abs
+_resample = pipeline_core.resample
 
 
 # ──────────────────────────────────────────────
 #  Step 1 — Resolve device
 # ──────────────────────────────────────────────
-def resolve_device(device: str) -> str:
-    """Resolve 'auto' → 'cuda' when available, else 'cpu'. Passes others through."""
-    if device != "auto":
-        return device
-    try:
-        import torch
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except Exception:
-        return "cpu"
+resolve_device = pipeline_core.resolve_device_str
 
 
 # ──────────────────────────────────────────────
@@ -263,8 +224,11 @@ def save_manifest(
 #  CLI entry-point
 # ──────────────────────────────────────────────
 def main() -> None:
+    # UTF-8 stdio before the first banner: the box-drawing glyphs below die on
+    # a cp1252 fallback when stdout is piped or redirected (Windows).
+    pipeline_core.enable_utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="Dubly ME — Phase F0: Source Separation (Demucs)",
+        description=f"Dubly ME — {pipeline_core.phase_title('F0')} (Demucs)",
     )
     parser.add_argument(
         "--source",
@@ -306,7 +270,7 @@ def main() -> None:
 
     print()
     print(f"{'═' * 60}")
-    print(f"  Dubly ME — Phase F0: Source Separation (Demucs)")
+    print(f"  Dubly ME — {pipeline_core.phase_title('F0')} (Demucs)")
     print(f"{'═' * 60}")
 
     source = Path(args.source)
@@ -356,7 +320,7 @@ def main() -> None:
     t_total = time.perf_counter() - t_start
     print()
     print(f"{'═' * 60}")
-    print(f"  ✅  Phase F0 complete — Source Separation")
+    print(f"  ✅  Phase F0 complete — {pipeline_core.PHASES['F0']['label']}")
     print(f"{'─' * 60}")
     print(f"  Background bed : {bg_path}")
     print(f"  Vocals stem    : {vocals_path}")

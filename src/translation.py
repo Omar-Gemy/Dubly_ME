@@ -27,15 +27,17 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+import pipeline_core
+
 # ──────────────────────────────────────────────
 #  Project paths (relative to repo root)
 # ──────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
+PROJECT_ROOT = pipeline_core.PROJECT_ROOT
+ARTIFACTS_DIR = pipeline_core.ARTIFACTS_DIR
 DEFAULT_INPUT = ARTIFACTS_DIR / "transcripts.json"
 DEFAULT_OUTPUT = ARTIFACTS_DIR / "translation.json"
 DEFAULT_MODEL = "Qwen/Qwen2.5-14B-Instruct-AWQ"
-DEFAULT_GLOSSARY = PROJECT_ROOT / "config" / "name_glossary.json"
+DEFAULT_GLOSSARY = pipeline_core.CONFIG_DIR / "name_glossary.json"
 
 
 # ──────────────────────────────────────────────
@@ -378,30 +380,11 @@ def preprocess_segments(segments: list[dict]) -> list[dict]:
 # ── Dynamic Language Matrix (Phase 1b) ───────────────────────────
 # Drives prompt wording + post-generation leakage stripping per language.
 # Each key is an XTTS v2 language tag, so translation and TTS stay in lockstep.
-LANGUAGES = {
-    "ar": {
-        "name": "Egyptian Arabic",
-        "output_desc": "natural, idiomatic spoken Egyptian Arabic dialogue",
-        "unit": "Arabic",
-        "leakage": ["بالتأكيد", "إليك", "الترجمة هي", "طبعاً", "بالطبع",
-                    "يمكنني", "هذه هي", "إليكم"],
-    },
-    "en": {
-        "name": "English",
-        "output_desc": "natural, idiomatic spoken English",
-        "unit": "English",
-        "leakage": ["sure,", "here is", "i can help", "please provide",
-                    "i'd be happy", "of course", "certainly",
-                    "let me", "i'll translate", "the translation is"],
-    },
-    "es": {
-        "name": "Spanish",
-        "output_desc": "natural, idiomatic spoken Spanish (neutral Latin American)",
-        "unit": "Spanish",
-        "leakage": ["claro,", "aquí está", "aquí tienes", "por supuesto",
-                    "puedo ayudar", "la traducción es", "desde luego"],
-    },
-}
+#
+# Sourced from config/languages.json via pipeline_core (5.11): adding a language
+# is now a config edit, and Phase C's ASR prompts, this matrix and Phase E's
+# XTTS tag set can no longer drift apart.
+LANGUAGES = pipeline_core.translation_language_matrix()
 
 
 def build_system_prompt(source_lang: str, target_lang: str) -> str:
@@ -708,8 +691,11 @@ def save_translation(data: dict, output_path: str) -> None:
 #  CLI entry-point
 # ──────────────────────────────────────────────
 def main() -> None:
+    # UTF-8 stdio before the first banner: the box-drawing glyphs below die on
+    # a cp1252 fallback when stdout is piped or redirected (Windows).
+    pipeline_core.enable_utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="Dubly ME — Phase D: Contextual Translation & Adaptation",
+        description=f"Dubly ME — {pipeline_core.phase_title('D')}",
     )
     parser.add_argument(
         "--input",

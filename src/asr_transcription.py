@@ -1,6 +1,6 @@
 """
-asr_transcription.py — Phase C: ASR Layer
-==========================================
+asr_transcription.py — Phase C: ASR Transcription
+=================================================
 Offline speech-to-text transcription using WhisperX (faster-whisper /
 CTranslate2 backend + wav2vec2 forced alignment).  No third-party APIs.
 
@@ -38,21 +38,26 @@ from pathlib import Path
 
 import numpy as np
 
+import pipeline_core
+
 # ──────────────────────────────────────────────
 #  Project paths (relative to repo root)
 # ──────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
-DEFAULT_AUDIO = PROJECT_ROOT / "data" / "audio_out" / "_temp_normalised.wav"
+PROJECT_ROOT = pipeline_core.PROJECT_ROOT
+ARTIFACTS_DIR = pipeline_core.ARTIFACTS_DIR
+DEFAULT_AUDIO = pipeline_core.DATA_AUDIO_OUT / "_temp_normalised.wav"
 DEFAULT_SEGMENTS = ARTIFACTS_DIR / "segments.json"
 DEFAULT_OUTPUT = ARTIFACTS_DIR / "transcripts.json"
-LANGUAGE_REGISTRY_PATH = PROJECT_ROOT / "config" / "language_registry.json"
+LANGUAGE_REGISTRY_PATH = pipeline_core.LANGUAGES_FILE
+
+# WhisperX / wav2vec2 operating rate — declared once in pipeline_core (5.5).
+SAMPLE_RATE = pipeline_core.ASR_SAMPLE_RATE
 
 
 # ──────────────────────────────────────────────
 #  Language Registry — dynamic config loader
 # ──────────────────────────────────────────────
-REQUIRED_LANG_KEYS = {"name", "whisper_language", "initial_prompt", "hallucination_patterns"}
+REQUIRED_LANG_KEYS = pipeline_core.ASR_LANGUAGE_KEYS
 
 # Fallback config used when the detected/forced language is not in the registry.
 FALLBACK_LANGUAGE_CONFIG = {
@@ -65,20 +70,23 @@ FALLBACK_LANGUAGE_CONFIG = {
 
 def load_language_registry(registry_path: Path = LANGUAGE_REGISTRY_PATH) -> dict:
     """
-    Load and validate the language registry JSON file.
+    Load and validate the language configuration.
 
-    Each language entry must contain: name, whisper_language,
-    initial_prompt, and hallucination_patterns.
+    Returns the Phase C view of config/languages.json: a dict keyed by language
+    code, each entry carrying name, whisper_language, initial_prompt and
+    hallucination_patterns. A legacy config/language_registry.json may still be
+    passed explicitly and is accepted as-is (5.11).
 
-    Returns the parsed registry dict keyed by language code.
     Raises SystemExit on I/O or validation errors.
     """
-    if not registry_path.is_file():
-        print(f"✖  Language registry not found: {registry_path}")
+    try:
+        registry = pipeline_core.asr_language_registry(registry_path)
+    except pipeline_core.LanguageConfigError as exc:
+        print(f"✖  {exc}")
         sys.exit(1)
-
-    with open(registry_path, "r", encoding="utf-8") as fh:
-        registry = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"✖  Could not read language configuration {registry_path}: {exc}")
+        sys.exit(1)
 
     # Validate every language entry
     for lang_code, config in registry.items():
@@ -361,7 +369,7 @@ def assign_words_to_segments_by_overlap(
 def apply_segment_gates(
     segments: list[dict],
     audio: np.ndarray,
-    sample_rate: int = 16000,
+    sample_rate: int = SAMPLE_RATE,
     rms_gate_db: float = RMS_GATE_DB,
     min_segment_sec: float = MIN_SEGMENT_SEC,
 ) -> dict:
@@ -612,7 +620,7 @@ def transcribe_full_file(
     gate_stats = apply_segment_gates(
         segments,
         audio,
-        sample_rate=16000,
+        sample_rate=SAMPLE_RATE,
         rms_gate_db=rms_gate_db,
         min_segment_sec=min_segment_sec,
     )
@@ -707,8 +715,11 @@ def save_transcripts(data: dict, output_path: str) -> None:
 #  CLI entry-point
 # ──────────────────────────────────────────────
 def main() -> None:
+    # UTF-8 stdio before the first banner: the box-drawing glyphs below die on
+    # a cp1252 fallback when stdout is piped or redirected (Windows).
+    pipeline_core.enable_utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="Dubly ME — Phase C: ASR Transcription (WhisperX)",
+        description=f"Dubly ME — {pipeline_core.phase_title('C')} (WhisperX)",
     )
     parser.add_argument(
         "--input-audio",

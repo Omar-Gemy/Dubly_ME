@@ -31,7 +31,6 @@ import argparse
 import gc
 import json
 import os
-os.environ["COQUI_TOS_AGREED"] = "1"
 import subprocess
 import sys
 import time
@@ -41,12 +40,20 @@ from pathlib import Path
 import soundfile as sf
 import torch
 
+import pipeline_core
+
+# Coqui's XTTS v2 weights are gated behind a non-commercial licence prompt that
+# blocks on stdin unless this is set. It is applied in accept_coqui_tos() right
+# before the TTS import — NOT at module import time, so `import tts_synthesis`
+# has no environment side-effect (5.10).
+COQUI_TOS_ENV_VAR = "COQUI_TOS_AGREED"
+
 # ──────────────────────────────────────────────
 #  Project paths (relative to repo root)
 # ──────────────────────────────────────────────
-PROJECT_ROOT   = Path(__file__).resolve().parent.parent
-ARTIFACTS_DIR  = PROJECT_ROOT / "artifacts"
-AUDIO_IN_DIR   = PROJECT_ROOT / "data" / "audio_in"
+PROJECT_ROOT   = pipeline_core.PROJECT_ROOT
+ARTIFACTS_DIR  = pipeline_core.ARTIFACTS_DIR
+AUDIO_IN_DIR   = pipeline_core.DATA_AUDIO_IN
 AUDIO_OUT_DIR  = ARTIFACTS_DIR / "audio_out"
 VOICE_PROFILES = PROJECT_ROOT / "voice_profiles"
 
@@ -54,20 +61,25 @@ DEFAULT_INPUT      = ARTIFACTS_DIR / "translation.json"
 DEFAULT_REF_AUDIO  = ARTIFACTS_DIR / "voice_ref.wav"
 DEFAULT_SOURCE     = AUDIO_IN_DIR / "sample.mp4"
 
+
+def accept_coqui_tos() -> None:
+    """Set COQUI_TOS_AGREED for this process (idempotent, no-op if already set)."""
+    os.environ.setdefault(COQUI_TOS_ENV_VAR, "1")
+
+
 # ──────────────────────────────────────────────
 #  Constants
 # ──────────────────────────────────────────────
 XTTS_MODEL_NAME    = "tts_models/multilingual/multi-dataset/xtts_v2"
-SAMPLE_RATE        = 22050     # XTTS v2 native sample rate
+SAMPLE_RATE        = pipeline_core.XTTS_NATIVE_SAMPLE_RATE   # 22050 Hz (5.5)
 CACHE_FLUSH_EVERY  = 5        # flush CUDA cache every N segments
+MIN_VRAM_GB        = 3.5      # below this, force CPU rather than risk OOM
 
 # XTTS v2's 17 built-in languages. The synthesis language is resolved from
 # translation.json's `target_language` (or --target-lang), NOT hardcoded —
 # so ar/en/es (and the rest) all work with no code change.
-XTTS_SUPPORTED_LANGS = {
-    "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl",
-    "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi",
-}
+# Sourced from config/languages.json via pipeline_core (5.11).
+XTTS_SUPPORTED_LANGS = pipeline_core.xtts_supported_languages()
 
 # Phase 2 — multi-speaker voice references.
 SPEAKER_UNKNOWN_LABEL = "SPEAKER_UNKNOWN"   # diarization catch-all bucket
@@ -289,22 +301,19 @@ def load_tts_model(device: str = "auto"):
       - Fall back to CPU if CUDA is unavailable
       - All inference runs under torch.no_grad() context
     """
+    # Must precede the TTS import: the licence prompt is evaluated there (5.10).
+    accept_coqui_tos()
     from TTS.api import TTS
 
     # ── Resolve device ──────────────────────────
-    if device == "auto":
-        if torch.cuda.is_available():
-            device = "cuda"
-        else:
-            device = "cpu"
+    device = pipeline_core.resolve_device_str(device)
 
     if device == "cuda":
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        gpu_name, vram_gb = pipeline_core.cuda_device_summary()
         print(f"  GPU detected : {gpu_name} ({vram_gb:.1f} GB VRAM)")
 
-        if vram_gb < 3.5:
-            print(f"  ⚠ VRAM below 3.5 GB — forcing CPU to avoid OOM")
+        if vram_gb < MIN_VRAM_GB:
+            print(f"  ⚠ VRAM below {MIN_VRAM_GB} GB — forcing CPU to avoid OOM")
             device = "cpu"
     else:
         print(f"  Running on CPU (slower but safe)")
@@ -415,10 +424,7 @@ def synthesize_segments(
         # ── Synthesize this segment ─────────────
         speaker_id = seg.get("speaker_id")
         ref_path = speaker_ref_map.get(speaker_id, global_ref)
-        try:
-            ref_rel = str(ref_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
-        except ValueError:
-            ref_rel = str(ref_path)
+        ref_rel = pipeline_core.rel_or_abs(ref_path)
 
         out_filename = f"segment_{seg_id:03d}.wav"
         out_path = output_dir / out_filename
@@ -452,9 +458,7 @@ def synthesize_segments(
                 "status": "success",
                 "speaker_id": speaker_id,
                 "reference_audio": ref_rel,
-                "output_file": str(
-                    out_path.relative_to(PROJECT_ROOT)
-                ).replace("\\", "/"),
+                "output_file": pipeline_core.rel_or_abs(out_path),
                 "duration_s": round(info.duration, 3),
                 "original_duration_s": seg.get("duration"),
                 "text": text,
@@ -517,11 +521,7 @@ def save_manifest(
     a top-level dict with metadata + a segments array. The speaker_profiles
     map records which reference clip cloned each speaker (Phase 2).
     """
-    def _rel(p) -> str:
-        try:
-            return str(Path(p).relative_to(PROJECT_ROOT)).replace("\\", "/")
-        except ValueError:
-            return str(p)
+    _rel = pipeline_core.rel_or_abs
 
     data = {
         "phase": "E",
@@ -586,8 +586,11 @@ def print_duration_comparison(manifest: list[dict]) -> None:
 #  CLI entry-point
 # ──────────────────────────────────────────────
 def main() -> None:
+    # UTF-8 stdio before the first banner: the box-drawing glyphs below die on
+    # a cp1252 fallback when stdout is piped or redirected (Windows).
+    pipeline_core.enable_utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="Dubly ME — Phase E: Voice Cloning & TTS Synthesis",
+        description=f"Dubly ME — {pipeline_core.phase_title('E')}",
     )
     parser.add_argument(
         "--input",
@@ -666,7 +669,7 @@ def main() -> None:
 
     print()
     print(f"{'═' * 60}")
-    print(f"  Dubly ME — Phase E: Voice Cloning & TTS Synthesis")
+    print(f"  Dubly ME — {pipeline_core.phase_title('E')}")
     print(f"{'═' * 60}")
 
     # ── Step 1: Validate inputs ─────────────────
@@ -758,7 +761,7 @@ def main() -> None:
 
     print()
     print(f"{'═' * 60}")
-    print(f"  ✅  Phase E complete — Voice Cloning & TTS")
+    print(f"  ✅  Phase E complete — {pipeline_core.PHASES['E']['label']}")
     print(f"{'─' * 60}")
     print(f"  Segments synthesized : {success}/{total_segs}")
     print(f"  Segments skipped     : {skipped}/{total_segs}")

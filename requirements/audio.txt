@@ -1,0 +1,22 @@
+# Dubly ME — Venv 3: Audio / TTS stack  (Phases E, F1, F2, F3)
+# ─────────────────────────────────────────────────────────────────
+#   python -m venv .venv_tts
+#   .venv_tts/bin/pip install -r requirements/audio.txt
+#
+# Phase E   tts_synthesis.py   XTTS v2 voice cloning (Coqui TTS)
+# Phase F1  time_stretch.py    Rubber Band / FFmpeg atempo duration fitting
+# Phase F2  mix_render.py      timeline assembly, ducking, mux
+# Phase F3  qa_report.py       stdlib only — no dependency of its own
+
+TTS                    # Coqui TTS — includes XTTS v2
+soundfile              # WAV I/O
+numpy<2.0              # timeline assembly
+scipy                  # polyphase resampling (pipeline_core.resample)
+pyrubberband           # formant-preserving WSOLA (needs the rubberband CLI)
+
+# SYSTEM dependencies — NOT installable via pip:
+#   FFmpeg          Windows: winget install FFmpeg
+#                   macOS:   brew install ffmpeg
+#                   Linux:   sudo apt install ffmpeg
+#   rubberband-cli  Linux:   sudo apt install rubberband-cli
+#                   Absent → time_stretch falls back to FFmpeg atempo.

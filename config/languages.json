@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "description": "Unified language configuration for Dubly ME. Single source of truth for Phase C (ASR prompts + hallucination patterns), Phase D (translation prompt wording + leakage stripping) and Phase E (XTTS language tags). Replaces config/language_registry.json plus the hardcoded matrices in translation.py and tts_synthesis.py (audit 5.11).",
+  "xtts_supported": [
+    "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl",
+    "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi"
+  ],
+  "languages": {
+    "ar": {
+      "name": "Arabic (Egyptian)",
+      "asr": {
+        "whisper_language": "ar",
+        "initial_prompt": "محادثة باللهجة المصرية العامية، جودة عالية.",
+        "hallucination_patterns": [
+          "اشتركوا في القناة",
+          "ترجمة نانسي قنقر",
+          "شكراً لكم",
+          "لا تنسوا الاشتراك",
+          "اشتركوا بالقناة",
+          "اشترك في القناة",
+          "اشترك بالقناة",
+          "لا تنسى الاشتراك",
+          "شكرا للمشاهدة",
+          "تابعونا"
+        ]
+      },
+      "translation": {
+        "name": "Egyptian Arabic",
+        "output_desc": "natural, idiomatic spoken Egyptian Arabic dialogue",
+        "unit": "Arabic",
+        "leakage": [
+          "بالتأكيد", "إليك", "الترجمة هي", "طبعاً", "بالطبع",
+          "يمكنني", "هذه هي", "إليكم"
+        ]
+      },
+      "tts": {
+        "xtts_language": "ar"
+      }
+    },
+    "en": {
+      "name": "English",
+      "asr": {
+        "whisper_language": "en",
+        "initial_prompt": "This is a clean, professional transcript in English with proper punctuation and capitalization.",
+        "hallucination_patterns": [
+          "Subscribe to my channel",
+          "Thanks for watching",
+          "Don't forget to subscribe",
+          "Like and subscribe",
+          "Hit the bell icon",
+          "Thank you for watching"
+        ]
+      },
+      "translation": {
+        "name": "English",
+        "output_desc": "natural, idiomatic spoken English",
+        "unit": "English",
+        "leakage": [
+          "sure,", "here is", "i can help", "please provide",
+          "i'd be happy", "of course", "certainly",
+          "let me", "i'll translate", "the translation is"
+        ]
+      },
+      "tts": {
+        "xtts_language": "en"
+      }
+    },
+    "es": {
+      "name": "Spanish",
+      "asr": {
+        "whisper_language": "es",
+        "initial_prompt": "Esta es una transcripción limpia y profesional en español con puntuación correcta.",
+        "hallucination_patterns": [
+          "Suscríbete al canal",
+          "Gracias por ver",
+          "No olvides suscribirte",
+          "Dale like y suscríbete",
+          "Subtítulos realizados por",
+          "Subtítulos por la comunidad"
+        ]
+      },
+      "translation": {
+        "name": "Spanish",
+        "output_desc": "natural, idiomatic spoken Spanish (neutral Latin American)",
+        "unit": "Spanish",
+        "leakage": [
+          "claro,", "aquí está", "aquí tienes", "por supuesto",
+          "puedo ayudar", "la traducción es", "desde luego"
+        ]
+      },
+      "tts": {
+        "xtts_language": "es"
+      }
+    }
+  }
+}
