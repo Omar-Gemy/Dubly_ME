@@ -1,27 +1,31 @@
 # Dubly ME — Venv 1: ASR stack  (Phases A, B, C)
 # ─────────────────────────────────────────────────────────────────
-#   python -m venv .venv_asr
-#   .venv_asr/Scripts/pip install -r requirements/asr.txt     (Windows)
-#   .venv_asr/bin/pip install -r requirements/asr.txt         (Linux/Colab)
+# PLATFORM-AGNOSTIC base set. torch/torchaudio/numpy are intentionally
+# UNPINNED so this file installs on both Colab (py3.12 — no torch 2.1.2 wheel
+# exists) and a local box. For the Windows-verified hard pins, install the
+# overlay instead:   pip install -r requirements/asr-local.txt
 #
 # Phase A  ingestion_vad.py       Silero VAD via torch.hub
 # Phase B  diarization.py         pyannote.audio (pulled by whisperx)
 # Phase C  asr_transcription.py   WhisperX + wav2vec2 forced alignment
-
-torch==2.1.2
-torchaudio==2.1.2
-numpy<2.0
-packaging
-soundfile
 
 # WhisperX pins compatible faster-whisper / ctranslate2 / pyannote.audio (3.1.1)
 # TRANSITIVELY — do NOT pin any of them here:
 #   • an explicit faster-whisper==1.2.1 conflicts with whisperx 3.3.1's pin
 #   • an explicit pyannote.audio==4.0.7 conflicts with whisperx's pyannote 3.1.1
 # The pyannote 3.1.1 ↔ new-torchaudio break (missing torchaudio.AudioMetaData)
-# is handled at runtime by src/torchaudio_compat.py, and diarization.py accepts
-# both the pyannote 3.x and 4.x pipeline return shapes.
+# is handled at runtime by src/torchaudio_compat.py, which is a no-op on the
+# older 2.1.x pin — so both torch generations are supported by design.
 whisperx==3.3.1
+
+# Unpinned on purpose (see header): satisfied by the platform's build under
+# --system-site-packages, or resolved transitively in a hermetic venv.
+torch
+torchaudio
+
+soundfile
+onnxruntime>=1.19.0
+packaging
 
 # ⚠ Phase B SETUP REQUIRED before first use:
 #   1. Create a Hugging Face account at https://huggingface.co
@@ -29,3 +33,4 @@ whisperx==3.3.1
 #   3. Accept https://huggingface.co/pyannote/segmentation-3.0
 #   4. Set your token:  $env:HF_TOKEN = "hf_your_token_here"   (PowerShell)
 #                       export HF_TOKEN=hf_your_token_here     (bash)
+#                       Colab: store it as the HF_TOKEN secret

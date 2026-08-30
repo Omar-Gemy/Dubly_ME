@@ -1,17 +1,20 @@
 # Dubly ME — Venv 4: Source separation  (Phase F0)
 # ─────────────────────────────────────────────────────────────────
-#   python -m venv .venv_demucs
-#   .venv_demucs/bin/pip install -r requirements/demucs.txt
+#   pip install -r requirements/demucs.txt
 #
 # Phase F0  source_separation.py   Demucs htdemucs two-stem separation.
 #
 # Demucs is torch-heavy and must not perturb the pinned ASR stack or the XTTS
 # venv, so it gets its own environment. mix_render only ever reads the WAV
 # artifacts this phase writes — never Demucs itself.
-
+#
+# torch is UNPINNED (demucs 4.x needs >= 2.0 and is not otherwise fussy), so
+# this venv can be built with --system-site-packages to reuse the platform's
+# torch instead of downloading a fourth copy. On Colab that is the difference
+# between fitting on disk and 'No space left on device'.
+torch
 demucs
 soundfile
-numpy<2.0
 scipy
 
 # FFmpeg is a SYSTEM dependency (audio extraction to 44.1 kHz stereo).

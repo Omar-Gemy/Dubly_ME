@@ -9,14 +9,16 @@
 #
 # Install the venv you actually need:
 #
-#   requirements/asr.txt      Venv 1 — Phases A, B, C   (torch 2.1.2, whisperx)
+#   requirements/asr.txt      Venv 1 — Phases A, B, C   (whisperx; torch unpinned)
+#   requirements/asr-local.txt  └ Windows overlay: torch/torchaudio 2.1.2, numpy<2
 #   requirements/llm.txt      Venv 2 — Phase D          (transformers 4.47.1, autoawq)
-#   requirements/audio.txt    Venv 3 — Phases E, F1–F3  (Coqui TTS, scipy, pyrubberband)
+#   requirements/audio.txt    Venv 3 — Phases E, F1–F3  (coqui-tts 0.27.5, torch 2.5.1)
 #   requirements/demucs.txt   Venv 4 — Phase F0         (demucs)
 #
-#   requirements-colab.txt    Colab base kernel only (ASR + LLM co-installed);
-#                             the TTS and Demucs venvs are built separately by
-#                             the notebook's setup cells.
+#   requirements-colab.txt    LEGACY: the old single-kernel Colab set (ASR + LLM
+#                             co-installed). Superseded by the 4-venv build in
+#                             notebooks/colab_pipeline_(Colab).ipynb; kept only
+#                             for reference.
 #
 # System dependencies (never pip): FFmpeg, and rubberband-cli for Phase F1's
 # preferred time-stretch engine.

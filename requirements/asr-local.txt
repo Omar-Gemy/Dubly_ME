@@ -1,0 +1,12 @@
+# Dubly ME — Venv 1 overlay: Windows-verified hard pins
+# ─────────────────────────────────────────────────────────────────
+#   pip install -r requirements/asr-local.txt
+#
+# This is the exact torch generation the local Windows environment was
+# validated against. Do NOT use it on Colab: torch 2.1.2 has no py3.12 wheel,
+# and numpy<2.0 conflicts with the platform's numpy-2-compiled extensions.
+-r asr.txt
+
+torch==2.1.2
+torchaudio==2.1.2
+numpy<2.0

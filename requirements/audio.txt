@@ -1,22 +1,32 @@
 # Dubly ME — Venv 3: Audio / TTS stack  (Phases E, F1, F2, F3)
 # ─────────────────────────────────────────────────────────────────
-#   python -m venv .venv_tts
-#   .venv_tts/bin/pip install -r requirements/audio.txt
+#   pip install -r requirements/audio.txt
 #
-# Phase E   tts_synthesis.py   XTTS v2 voice cloning (Coqui TTS)
+# Phase E   tts_synthesis.py   XTTS v2 voice cloning
 # Phase F1  time_stretch.py    Rubber Band / FFmpeg atempo duration fitting
 # Phase F2  mix_render.py      timeline assembly, ducking, mux
 # Phase F3  qa_report.py       stdlib only — no dependency of its own
-
-TTS                    # Coqui TTS — includes XTTS v2
-soundfile              # WAV I/O
-numpy<2.0              # timeline assembly
+#
+# ⚠ THIS PIN SET IS LOAD-BEARING AND MUTUALLY CONSTRAINED. Do not loosen it:
+#   • coqui-tts 0.27.5   is the MAINTAINED fork; the abandoned `TTS` package
+#                        must NOT be used (it installs an older XTTS whose
+#                        generation kwargs differ from XTTS_GEN_DEFAULTS).
+#   • coqui-tts >= 0.27  REQUIRES transformers >= 4.57 — it imports
+#                        `is_torch_greater_or_equal`, added in 4.48. Installing
+#                        the Phase D pin (4.47.1) here breaks Phase E on import.
+#   • torch 2.5.1 (<2.6) has stable CUDA wheels for py3.12 AND predates the
+#                        torch.load weights_only default flip.
+torch==2.5.1
+torchaudio==2.5.1
+coqui-tts==0.27.5
+transformers==4.57.6
+soundfile
+numpy>=1.26            # required by coqui-tts 0.27.x
 scipy                  # polyphase resampling (pipeline_core.resample)
 pyrubberband           # formant-preserving WSOLA (needs the rubberband CLI)
 
 # SYSTEM dependencies — NOT installable via pip:
 #   FFmpeg          Windows: winget install FFmpeg
-#                   macOS:   brew install ffmpeg
-#                   Linux:   sudo apt install ffmpeg
-#   rubberband-cli  Linux:   sudo apt install rubberband-cli
+#                   Linux/Colab: apt install ffmpeg   (preinstalled on Colab)
+#   rubberband-cli  Linux/Colab: apt install rubberband-cli
 #                   Absent → time_stretch falls back to FFmpeg atempo.
